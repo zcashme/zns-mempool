@@ -6,7 +6,7 @@ use zcash_primitives::{block::Block, transaction::Transaction};
 use zcash_protocol::consensus::{BranchId, MainNetwork};
 use zcash_transparent::keys::IncomingViewingKey;
 
-use crate::{decrypt::DecryptedShieldedOutput, decrypt::ViewKey};
+use crate::{decrypt::DecryptedShieldedOutput, decrypt::Wallet};
 
 // ── Scanner output types ───────────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ pub struct DetectedOutput {
 // ── Public entry points ────────────────────────────────────────────────────
 
 /// Scans a raw block for outputs decryptable by any view key.
-pub fn scan_block(bytes: &[u8], view_keys: &[ViewKey], height: u32) -> Result<Vec<DetectedOutput>> {
+pub fn scan_block(bytes: &[u8], view_keys: &[Wallet], height: u32) -> Result<Vec<DetectedOutput>> {
     let block = Block::read(Cursor::new(bytes), &MainNetwork).context("failed to parse block")?;
     let (_, transactions) = block.into_parts();
 
@@ -65,7 +65,7 @@ pub fn scan_block(bytes: &[u8], view_keys: &[ViewKey], height: u32) -> Result<Ve
 /// Scans a raw mempool transaction for outputs decryptable by any view key.
 pub fn scan_mempool_tx(
     bytes: &[u8],
-    view_keys: &[ViewKey],
+    view_keys: &[Wallet],
     chain_tip: u32,
 ) -> Result<Vec<DetectedOutput>> {
     let branch_id = BranchId::for_height(&MainNetwork, chain_tip.into());
@@ -90,7 +90,7 @@ pub fn scan_mempool_tx(
 
 fn scan_transaction(
     tx: &Transaction,
-    view_keys: &[ViewKey],
+    view_keys: &[Wallet],
     t_index: &[(String, Vec<u8>)],
     status: Status,
     effective_height: u32,
@@ -115,7 +115,7 @@ fn scan_transaction(
 
 fn scan_shielded_outputs(
     tx: &Transaction,
-    view_keys: &[ViewKey],
+    view_keys: &[Wallet],
     effective_height: u32,
     txid: &str,
     status: Status,
@@ -184,7 +184,7 @@ fn shielded_to_detected_output(
 }
 
 /// Pre-derived transparent scripts for each view key, used for fast matching.
-fn transparent_index(view_keys: &[ViewKey]) -> Vec<(String, Vec<u8>)> {
+fn transparent_index(view_keys: &[Wallet]) -> Vec<(String, Vec<u8>)> {
     view_keys
         .iter()
         .filter_map(|vk| {

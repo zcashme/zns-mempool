@@ -13,8 +13,7 @@ use tracing::{error, info, warn};
 use zebra_indexer_proto::{Empty, ZebraClient, mempool_change_message::ChangeType};
 
 use crate::chain::Node;
-use crate::decrypt::ViewKey;
-use crate::store::{Birthdays, OutputIndex};
+use crate::decrypt::Wallet;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -38,19 +37,11 @@ async fn main() -> Result<()> {
         .context("failed to connect to Postgres")?;
     let node = Node::connect(&rpc_url)?;
 
-    let (keys, output_index, birthdays) = store::load_view_keys(&pool).await?;
-    let view_keys = Arc::new(RwLock::new(keys));
-    let output_index = Arc::new(RwLock::new(output_index));
-    let birthdays = Arc::new(RwLock::new(birthdays));
+    let wallets = Arc::new(RwLock::new(store::load_view_keys(&pool).await?));
 
-    let key_task = tokio::spawn(refresh_keys(
-        pool.clone(),
-        view_keys.clone(),
-        output_index.clone(),
-        birthdays.clone(),
-    ));
-    let expiry_task = tokio::spawn(expire_mempool(pool.clone(), output_index.clone()));
-    let scanner_task = tokio::spawn(run_scanner(pool, view_keys, output_index, birthdays, node));
+    let key_task = tokio::spawn(refresh_keys(pool.clone(), wallets.clone()));
+    let expiry_task = tokio::spawn(expire_mempool(pool.clone(), wallets.clone()));
+    let scanner_task = tokio::spawn(run_scanner(pool, wallets, node));
 
     tokio::select! {
         result = key_task => result.context("key-refresh task panicked")??,
@@ -63,47 +54,28 @@ async fn main() -> Result<()> {
 
 // ── Scanner loop: catch up to tip, then watch mempool ──────────────────────
 
-async fn run_scanner(
-    pool: PgPool,
-    view_keys: Arc<RwLock<Vec<ViewKey>>>,
-    output_index: Arc<RwLock<OutputIndex>>,
-    birthdays: Arc<RwLock<Birthdays>>,
-    node: Node,
-) -> Result<()> {
+async fn run_scanner(pool: PgPool, wallets: Arc<RwLock<Vec<Wallet>>>, node: Node) -> Result<()> {
     loop {
-        catch_up(&pool, &view_keys, &output_index, &birthdays, &node).await?;
-        watch_mempool(&pool, &view_keys, &output_index, &birthdays, &node).await?;
+        catch_up(&pool, &wallets, &node).await?;
+        watch_mempool(&pool, &wallets, &node).await?;
     }
 }
 
 /// Scans blocks from the lowest resume height across all view keys until at chain tip.
-async fn catch_up(
-    pool: &PgPool,
-    view_keys: &Arc<RwLock<Vec<ViewKey>>>,
-    output_index: &Arc<RwLock<OutputIndex>>,
-    birthdays: &Arc<RwLock<Birthdays>>,
-    node: &Node,
-) -> Result<()> {
+async fn catch_up(pool: &PgPool, wallets: &Arc<RwLock<Vec<Wallet>>>, node: &Node) -> Result<()> {
     loop {
         let tip = node.block_count().await?;
-        let keys = view_keys.read().await.clone();
-        let index = output_index.read().await.clone();
-        let birthdays = birthdays.read().await.clone();
+        let wallets = wallets.read().await.clone();
 
-        if keys.is_empty() {
+        if wallets.is_empty() {
             time::sleep(BLOCK_POLL).await;
             continue;
         }
 
         let mut min_resume = u32::MAX;
-        for vk in &keys {
-            let table = index.get(&vk.recipient_address).context(format!(
-                "no reserve table configured for {}",
-                vk.recipient_address
-            ))?;
-            let birthday = birthdays.get(&vk.recipient_address).copied().flatten();
-            let max_confirmed = store::max_confirmed_height(pool, table).await?;
-            let resume = compute_resume_height(max_confirmed, birthday);
+        for w in &wallets {
+            let max_confirmed = store::max_confirmed_height(pool, &w.reserve_table_name).await?;
+            let resume = compute_resume_height(max_confirmed, w.birthday_height);
             min_resume = min_resume.min(resume);
         }
 
@@ -114,8 +86,8 @@ async fn catch_up(
         for height in min_resume..=tip {
             let hash = node.block_hash(height).await?;
             let bytes = node.raw_block(&hash).await?;
-            let outputs = scanner::scan_block(&bytes, &keys, height)?;
-            store::write_outputs(pool, &outputs, &index).await?;
+            let outputs = scanner::scan_block(&bytes, &wallets, height)?;
+            store::write_outputs(pool, &outputs, &wallets).await?;
 
             if !outputs.is_empty() {
                 info!(height, outputs = outputs.len(), "scanned block");
@@ -133,9 +105,7 @@ async fn catch_up(
 /// Watches mempool via gRPC stream. Returns when new blocks are detected.
 async fn watch_mempool(
     pool: &PgPool,
-    view_keys: &Arc<RwLock<Vec<ViewKey>>>,
-    output_index: &Arc<RwLock<OutputIndex>>,
-    birthdays: &Arc<RwLock<Birthdays>>,
+    wallets: &Arc<RwLock<Vec<Wallet>>>,
     node: &Node,
 ) -> Result<()> {
     let indexer_url = std::env::var("NODE_INDEXER_GRPC_URL")
@@ -167,11 +137,10 @@ async fn watch_mempool(
                         Ok(Some(event)) => match ChangeType::try_from(event.change_type) {
                             Ok(ChangeType::Added) => {
                                 let txid = hex::encode(event.tx_hash);
-                                let keys = view_keys.read().await.clone();
-                                let index = output_index.read().await.clone();
+                                let wallets = wallets.read().await.clone();
                                 let tip = node.block_count().await?;
                                 if let Err(err) = scan_one_mempool_tx(
-                                    pool, &keys, &index, node, &txid, &mut seen, tip,
+                                    pool, &wallets, node, &txid, &mut seen, tip,
                                 ).await {
                                     warn!(%err, %txid, "could not scan mempool transaction");
                                 }
@@ -185,7 +154,7 @@ async fn watch_mempool(
                     }
                 }
                 _ = block_check.tick() => {
-                    if new_blocks_available(pool, view_keys, output_index, birthdays, node).await? {
+                    if new_blocks_available(pool, wallets, node).await? {
                         return Ok(());
                     }
                 }
@@ -199,26 +168,17 @@ async fn watch_mempool(
 
 async fn new_blocks_available(
     pool: &PgPool,
-    view_keys: &Arc<RwLock<Vec<ViewKey>>>,
-    output_index: &Arc<RwLock<OutputIndex>>,
-    birthdays: &Arc<RwLock<Birthdays>>,
+    wallets: &Arc<RwLock<Vec<Wallet>>>,
     node: &Node,
 ) -> Result<bool> {
-    let keys = view_keys.read().await.clone();
-    let index = output_index.read().await.clone();
-    let birthdays = birthdays.read().await.clone();
-    if keys.is_empty() {
+    let wallets = wallets.read().await.clone();
+    if wallets.is_empty() {
         return Ok(false);
     }
     let tip = node.block_count().await?;
-    for vk in &keys {
-        let table = index.get(&vk.recipient_address).context(format!(
-            "no reserve table configured for {}",
-            vk.recipient_address
-        ))?;
-        let birthday = birthdays.get(&vk.recipient_address).copied().flatten();
-        let max_confirmed = store::max_confirmed_height(pool, table).await?;
-        let resume = compute_resume_height(max_confirmed, birthday);
+    for w in &wallets {
+        let max_confirmed = store::max_confirmed_height(pool, &w.reserve_table_name).await?;
+        let resume = compute_resume_height(max_confirmed, w.birthday_height);
         if resume <= tip {
             return Ok(true);
         }
@@ -228,8 +188,7 @@ async fn new_blocks_available(
 
 async fn scan_one_mempool_tx(
     pool: &PgPool,
-    keys: &[ViewKey],
-    output_index: &OutputIndex,
+    wallets: &[Wallet],
     node: &Node,
     txid: &str,
     seen: &mut HashSet<String>,
@@ -239,8 +198,8 @@ async fn scan_one_mempool_tx(
         return Ok(());
     }
     let bytes = node.raw_transaction(txid).await?;
-    let outputs = scanner::scan_mempool_tx(&bytes, keys, tip)?;
-    store::write_outputs(pool, &outputs, output_index).await?;
+    let outputs = scanner::scan_mempool_tx(&bytes, wallets, tip)?;
+    store::write_outputs(pool, &outputs, wallets).await?;
     seen.insert(txid.to_owned());
     if !outputs.is_empty() {
         info!(%txid, outputs = outputs.len(), "detected mempool payment");
@@ -261,32 +220,23 @@ fn compute_resume_height(max_confirmed: Option<i64>, birthday_height: Option<i64
 
 // ── Background tasks ───────────────────────────────────────────────────────
 
-async fn refresh_keys(
-    pool: PgPool,
-    view_keys: Arc<RwLock<Vec<ViewKey>>>,
-    output_index: Arc<RwLock<OutputIndex>>,
-    birthdays: Arc<RwLock<Birthdays>>,
-) -> Result<()> {
+async fn refresh_keys(pool: PgPool, wallets: Arc<RwLock<Vec<Wallet>>>) -> Result<()> {
     let mut interval = time::interval(KEY_REFRESH);
     loop {
         interval.tick().await;
         match store::load_view_keys(&pool).await {
-            Ok((next_keys, next_index, next_birthdays)) => {
-                *view_keys.write().await = next_keys;
-                *output_index.write().await = next_index;
-                *birthdays.write().await = next_birthdays;
-            }
+            Ok(next) => *wallets.write().await = next,
             Err(err) => error!(%err, "could not refresh view keys; retaining last good set"),
         }
     }
 }
 
-async fn expire_mempool(pool: PgPool, output_index: Arc<RwLock<OutputIndex>>) -> Result<()> {
+async fn expire_mempool(pool: PgPool, wallets: Arc<RwLock<Vec<Wallet>>>) -> Result<()> {
     let mut interval = time::interval(Duration::from_secs(60));
     loop {
         interval.tick().await;
-        let index = output_index.read().await;
-        match store::expire_mempool(&pool, MEMPOOL_EXPIRY_SECS, &index).await {
+        let wallets = wallets.read().await;
+        match store::expire_mempool(&pool, MEMPOOL_EXPIRY_SECS, &wallets).await {
             Ok(expired) if expired > 0 => info!(expired, "marked stale mempool payments expired"),
             Ok(_) => {}
             Err(err) => warn!(%err, "mempool expiry pass failed"),

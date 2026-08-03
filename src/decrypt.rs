@@ -24,11 +24,13 @@ pub struct DecryptedShieldedOutput {
     pub memo: [u8; 512],
 }
 
-/// A view key loaded from the database, ready for trial decryption.
+/// One row from `zn_view_keys`: a wallet's view key plus scanner config.
 #[derive(Clone)]
-pub struct ViewKey {
+pub struct Wallet {
     pub ufvk: UnifiedFullViewingKey,
     pub recipient_address: String,
+    pub reserve_table_name: String,
+    pub birthday_height: Option<i64>,
 }
 
 /// Trial-decrypts every shielded output in `tx` against the supplied view keys.
@@ -37,7 +39,7 @@ pub struct ViewKey {
 /// `chain_tip + 1` for mempool transactions (matching upstream's "mempool height").
 pub fn decrypt_transaction(
     tx: &Transaction,
-    view_keys: &[ViewKey],
+    view_keys: &[Wallet],
     effective_height: u32,
 ) -> Vec<DecryptedShieldedOutput> {
     let mut found = Vec::new();
@@ -59,7 +61,7 @@ pub fn decrypt_transaction(
 
 fn decrypt_sapling(
     bundle: &SaplingBundle<sapling_crypto::bundle::Authorized, ZatBalance>,
-    view_keys: &[ViewKey],
+    view_keys: &[Wallet],
     effective_height: u32,
     found: &mut Vec<DecryptedShieldedOutput>,
 ) {
@@ -85,7 +87,7 @@ fn decrypt_sapling(
 
 fn decrypt_orchard_pool<V: DomainVersion>(
     bundle: &Bundle<Authorized, ZatBalance>,
-    view_keys: &[ViewKey],
+    view_keys: &[Wallet],
     pool_name: &'static str,
     found: &mut Vec<DecryptedShieldedOutput>,
 ) {
@@ -115,7 +117,7 @@ fn sapling_zip212_enforcement(height: u32) -> Zip212Enforcement {
     )
 }
 
-fn sapling_ivks(view_keys: &[ViewKey]) -> Vec<(String, PreparedSaplingIvk)> {
+fn sapling_ivks(view_keys: &[Wallet]) -> Vec<(String, PreparedSaplingIvk)> {
     view_keys
         .iter()
         .filter_map(|vk| {
@@ -129,7 +131,7 @@ fn sapling_ivks(view_keys: &[ViewKey]) -> Vec<(String, PreparedSaplingIvk)> {
         .collect()
 }
 
-fn orchard_ivks(view_keys: &[ViewKey]) -> Vec<(String, PreparedOrchardIvk)> {
+fn orchard_ivks(view_keys: &[Wallet]) -> Vec<(String, PreparedOrchardIvk)> {
     view_keys
         .iter()
         .filter_map(|vk| {

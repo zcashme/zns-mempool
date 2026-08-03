@@ -5,15 +5,9 @@ use sqlx::PgPool;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::MainNetwork;
 
-use crate::{decrypt::ViewKey, scanner::DetectedOutput, scanner::Status};
+use crate::{decrypt::Wallet, scanner::DetectedOutput, scanner::Status};
 
-/// Maps `recipient_address` to the physical table where that account's outputs are written.
-pub type OutputIndex = HashMap<String, String>;
-
-/// Maps `recipient_address` to its optional `birthday_height`.
-pub type Birthdays = HashMap<String, Option<i64>>;
-
-pub async fn load_view_keys(pool: &PgPool) -> Result<(Vec<ViewKey>, OutputIndex, Birthdays)> {
+pub async fn load_view_keys(pool: &PgPool) -> Result<Vec<Wallet>> {
     let rows = sqlx::query!(
         "select recipient_address, view_key, reserve_table_name, birthday_height
          from public.zn_view_keys
@@ -23,9 +17,7 @@ pub async fn load_view_keys(pool: &PgPool) -> Result<(Vec<ViewKey>, OutputIndex,
     .await
     .context("failed to load view keys")?;
 
-    let mut keys = Vec::with_capacity(rows.len());
-    let mut output_index = OutputIndex::with_capacity(rows.len());
-    let mut birthdays = Birthdays::with_capacity(rows.len());
+    let mut wallets = Vec::with_capacity(rows.len());
     for row in rows {
         let ufvk = UnifiedFullViewingKey::decode(&MainNetwork, &row.view_key).map_err(|e| {
             anyhow::anyhow!(
@@ -33,14 +25,14 @@ pub async fn load_view_keys(pool: &PgPool) -> Result<(Vec<ViewKey>, OutputIndex,
                 recipient = row.recipient_address
             )
         })?;
-        output_index.insert(row.recipient_address.clone(), row.reserve_table_name);
-        birthdays.insert(row.recipient_address.clone(), row.birthday_height);
-        keys.push(ViewKey {
+        wallets.push(Wallet {
             recipient_address: row.recipient_address,
             ufvk,
+            reserve_table_name: row.reserve_table_name,
+            birthday_height: row.birthday_height,
         });
     }
-    Ok((keys, output_index, birthdays))
+    Ok(wallets)
 }
 
 /// Returns the maximum confirmed block height in the reserve table, if any.
@@ -58,15 +50,21 @@ pub async fn max_confirmed_height(pool: &PgPool, reserve_table_name: &str) -> Re
 pub async fn write_outputs(
     pool: &PgPool,
     outputs: &[DetectedOutput],
-    output_index: &OutputIndex,
+    wallets: &[Wallet],
 ) -> Result<()> {
+    let table_map: HashMap<&str, &str> = wallets
+        .iter()
+        .map(|w| (w.recipient_address.as_str(), w.reserve_table_name.as_str()))
+        .collect();
+
     for output in outputs {
-        let reserve_table_name = output_index
-            .get(&output.recipient_address)
-            .context(format!(
-                "no reserve table configured for {}",
-                output.recipient_address
-            ))?;
+        let reserve_table_name =
+            table_map
+                .get(output.recipient_address.as_str())
+                .context(format!(
+                    "no reserve table configured for {}",
+                    output.recipient_address
+                ))?;
 
         let sql = format!(
             "insert into public.{tbl} (
@@ -99,13 +97,12 @@ pub async fn write_outputs(
     Ok(())
 }
 
-pub async fn expire_mempool(
-    pool: &PgPool,
-    expiry_seconds: i64,
-    output_index: &OutputIndex,
-) -> Result<u64> {
+pub async fn expire_mempool(pool: &PgPool, expiry_seconds: i64, wallets: &[Wallet]) -> Result<u64> {
     let mut total = 0u64;
-    let unique_names: HashSet<&String> = output_index.values().collect();
+    let unique_names: HashSet<&str> = wallets
+        .iter()
+        .map(|w| w.reserve_table_name.as_str())
+        .collect();
     for name in unique_names {
         let result = sqlx::query(&format!(
             "update public.{name}
