@@ -3,7 +3,10 @@ use std::io::Cursor;
 use anyhow::{Context, Result};
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::{block::Block, transaction::Transaction};
-use zcash_protocol::consensus::{BranchId, MainNetwork};
+use zcash_protocol::{
+    consensus::{BranchId, MainNetwork},
+    memo::MemoBytes,
+};
 use zcash_transparent::keys::IncomingViewingKey;
 
 use crate::{decrypt::DecryptedShieldedOutput, decrypt::Wallet};
@@ -35,7 +38,7 @@ pub struct DetectedOutput {
     pub output_index: i32,
     pub amount_zats: i64,
     pub is_outgoing: bool,
-    pub memo: Option<String>,
+    pub memo: Option<MemoBytes>,
     pub status: Status,
     pub blockheight: Option<i64>,
 }
@@ -180,7 +183,7 @@ fn shielded_to_detected_output(
         output_index: output.output_index as i32,
         amount_zats: output.amount_zats as i64,
         is_outgoing: output.is_outgoing,
-        memo: std::str::from_utf8(&output.memo).ok().map(str::to_owned),
+        memo: Some(output.memo),
         status,
         blockheight,
     }
@@ -190,8 +193,9 @@ fn shielded_to_detected_output(
 fn transparent_index(view_keys: &[Wallet]) -> Vec<(String, Vec<u8>)> {
     view_keys
         .iter()
-        .filter_map(|vk| {
-            derive_transparent_script(&vk.ufvk).map(|script| (vk.recipient_address.clone(), script))
+        .filter_map(|wallet| {
+            derive_transparent_script(&wallet.ufvk)
+                .map(|script| (wallet.recipient_address.clone(), script))
         })
         .collect()
 }

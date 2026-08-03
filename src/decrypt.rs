@@ -11,7 +11,7 @@ use sapling_crypto::{
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_note_encryption::{try_note_decryption, try_output_recovery_with_ovk};
 use zcash_primitives::transaction::Transaction;
-use zcash_protocol::{consensus::MainNetwork, value::ZatBalance};
+use zcash_protocol::{consensus::MainNetwork, memo::MemoBytes, value::ZatBalance};
 use zip32::Scope;
 
 /// A shielded output decrypted by one of the scanner's view keys.
@@ -22,7 +22,7 @@ pub struct DecryptedShieldedOutput {
     pub output_index: usize,
     pub amount_zats: u64,
     pub is_outgoing: bool,
-    pub memo: [u8; 512],
+    pub memo: MemoBytes,
 }
 
 /// One row from `zn_view_keys`: a wallet's view key plus scanner config.
@@ -89,7 +89,8 @@ fn decrypt_sapling(
                     output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: false,
-                    memo,
+                    memo: MemoBytes::from_bytes(&memo)
+                        .expect("decryption always returns a 512-byte memo"),
                 });
                 break;
             }
@@ -101,7 +102,8 @@ fn decrypt_sapling(
                     output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
-                    memo,
+                    memo: MemoBytes::from_bytes(&memo)
+                        .expect("decryption always returns a 512-byte memo"),
                 });
                 break;
             }
@@ -119,7 +121,8 @@ fn decrypt_sapling(
                     output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
-                    memo,
+                    memo: MemoBytes::from_bytes(&memo)
+                        .expect("decryption always returns a 512-byte memo"),
                 });
                 break;
             }
@@ -170,7 +173,8 @@ fn decrypt_orchard_pool<V: DomainVersion>(
                     output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: false,
-                    memo,
+                    memo: MemoBytes::from_bytes(&memo)
+                        .expect("decryption always returns a 512-byte memo"),
                 });
                 break;
             }
@@ -182,7 +186,8 @@ fn decrypt_orchard_pool<V: DomainVersion>(
                     output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
-                    memo,
+                    memo: MemoBytes::from_bytes(&memo)
+                        .expect("decryption always returns a 512-byte memo"),
                 });
                 break;
             }
@@ -200,7 +205,8 @@ fn decrypt_orchard_pool<V: DomainVersion>(
                     output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
-                    memo,
+                    memo: MemoBytes::from_bytes(&memo)
+                        .expect("decryption always returns a 512-byte memo"),
                 });
                 break;
             }
