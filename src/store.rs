@@ -87,6 +87,7 @@ pub async fn write_outputs(
             .bind(output.pool)
             .bind(output.output_index)
             .bind(output.amount_zats)
+            .bind(output.is_outgoing)
             .bind(output.status.as_str())
             .bind(output.blockheight)
             .bind(&output.memo)

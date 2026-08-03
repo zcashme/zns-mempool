@@ -21,6 +21,7 @@ pub struct DecryptedShieldedOutput {
     pub pool: &'static str,
     pub output_index: usize,
     pub amount_zats: u64,
+    pub is_outgoing: bool,
     pub memo: [u8; 512],
 }
 
@@ -77,6 +78,7 @@ fn decrypt_sapling(
                     pool: "sapling",
                     output_index: index,
                     amount_zats: note.value().inner(),
+                    is_outgoing: false,
                     memo,
                 });
                 break;
@@ -102,6 +104,7 @@ fn decrypt_orchard_pool<V: DomainVersion>(
                     pool: pool_name,
                     output_index: index,
                     amount_zats: note.value().inner(),
+                    is_outgoing: false,
                     memo,
                 });
                 break;

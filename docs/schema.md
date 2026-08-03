@@ -65,6 +65,7 @@ create table public.zn_shithole (
         check (pool in ('sapling', 'orchard', 'ironwood', 'transparent')),
     output_index      int  not null,
     amount_zats       bigint not null,
+    is_outgoing       boolean not null default false,
 
     status            text not null default 'mempool'
         check (status in ('mempool', 'confirmed', 'expired')),
@@ -96,6 +97,7 @@ create table public.<table_name_you_choose> (
         check (pool in ('sapling', 'orchard', 'ironwood', 'transparent')),
     output_index      int  not null,
     amount_zats       bigint not null,
+    is_outgoing       boolean not null default false,
 
     status            text not null default 'mempool'
         check (status in ('mempool', 'confirmed', 'expired')),
@@ -121,8 +123,9 @@ create index idx_<table_name_you_choose>_blockheight
 | `txid` | Transaction id, hex-encoded. |
 | `pool` | Shielded pool or transparent. |
 | `output_index` | Output/action index within the transaction. |
-| `amount_zats` | Incoming amount in integer zatoshis. |
-| `status` | `mempool`, `confirmed`, `orphaned`, or `expired`. |
+| `amount_zats` | Amount in integer zatoshis. |
+| `is_outgoing` | `false` = incoming payment (external IVK). `true` = outgoing spend or change (OVK / internal IVK). |
+| `status` | `mempool`, `confirmed`, or `expired`. |
 | `blockheight` | Block height where this output was mined. Null for mempool outputs. |
 | `detected_at` | When the scanner's own full node first saw the transaction. |
 | `memo` | Decoded payment memo, if any. |
