@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
@@ -10,9 +10,12 @@ use crate::{decrypt::ViewKey, scanner::DetectedOutput, scanner::Status};
 /// Maps `recipient_address` to the physical table where that account's outputs are written.
 pub type OutputIndex = HashMap<String, String>;
 
-pub async fn load_view_keys(pool: &PgPool) -> Result<(Vec<ViewKey>, OutputIndex)> {
+/// Maps `recipient_address` to its optional `birthday_height`.
+pub type Birthdays = HashMap<String, Option<i64>>;
+
+pub async fn load_view_keys(pool: &PgPool) -> Result<(Vec<ViewKey>, OutputIndex, Birthdays)> {
     let rows = sqlx::query!(
-        "select recipient_address, view_key, reserve_table_name
+        "select recipient_address, view_key, reserve_table_name, birthday_height
          from public.zn_view_keys
          where is_active = true"
     )
@@ -22,6 +25,7 @@ pub async fn load_view_keys(pool: &PgPool) -> Result<(Vec<ViewKey>, OutputIndex)
 
     let mut keys = Vec::with_capacity(rows.len());
     let mut output_index = OutputIndex::with_capacity(rows.len());
+    let mut birthdays = Birthdays::with_capacity(rows.len());
     for row in rows {
         let ufvk = UnifiedFullViewingKey::decode(&MainNetwork, &row.view_key).map_err(|e| {
             anyhow::anyhow!(
@@ -30,45 +34,25 @@ pub async fn load_view_keys(pool: &PgPool) -> Result<(Vec<ViewKey>, OutputIndex)
             )
         })?;
         output_index.insert(row.recipient_address.clone(), row.reserve_table_name);
+        birthdays.insert(row.recipient_address.clone(), row.birthday_height);
         keys.push(ViewKey {
             recipient_address: row.recipient_address,
             ufvk,
         });
     }
-    Ok((keys, output_index))
+    Ok((keys, output_index, birthdays))
 }
 
-/// `max(blockheight) - 100` from the reserve table, falling back to
-/// `birthday_height` from `zn_view_keys`, then to 0.
-pub async fn resume_height(
-    pool: &PgPool,
-    recipient_address: &str,
-    output_index: &OutputIndex,
-) -> Result<u32> {
-    let reserve_table_name = output_index.get(recipient_address).context(format!(
-        "no reserve table configured for {recipient_address}"
-    ))?;
-
+/// Returns the maximum confirmed block height in the reserve table, if any.
+pub async fn max_confirmed_height(pool: &PgPool, reserve_table_name: &str) -> Result<Option<i64>> {
     let max_height: Option<i64> = sqlx::query_scalar(&format!(
-        "select max(blockheight) from public.{reserve_table_name} where status = 'confirmed'"
+        "select max(blockheight) from public.{reserve_table_name} where status = '{}'",
+        Status::Confirmed.as_str()
     ))
     .fetch_one(pool)
     .await
-    .context("failed to query max blockheight")?;
-
-    if let Some(max) = max_height {
-        return Ok((max - 100).max(0) as u32);
-    }
-
-    let birthday: Option<i64> = sqlx::query_scalar(
-        "select birthday_height from public.zn_view_keys where recipient_address = $1",
-    )
-    .bind(recipient_address)
-    .fetch_one(pool)
-    .await
-    .context("failed to query birthday_height")?;
-
-    Ok(birthday.and_then(|h| u32::try_from(h).ok()).unwrap_or(0))
+    .with_context(|| format!("failed to query max blockheight in {reserve_table_name}"))?;
+    Ok(max_height)
 }
 
 pub async fn write_outputs(
@@ -120,8 +104,6 @@ pub async fn expire_mempool(
     expiry_seconds: i64,
     output_index: &OutputIndex,
 ) -> Result<u64> {
-    use std::collections::HashSet;
-
     let mut total = 0u64;
     let unique_names: HashSet<&String> = output_index.values().collect();
     for name in unique_names {

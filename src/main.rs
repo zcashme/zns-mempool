@@ -14,7 +14,7 @@ use zebra_indexer_proto::{Empty, ZebraClient, mempool_change_message::ChangeType
 
 use crate::chain::Node;
 use crate::decrypt::ViewKey;
-use crate::store::OutputIndex;
+use crate::store::{Birthdays, OutputIndex};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -38,17 +38,19 @@ async fn main() -> Result<()> {
         .context("failed to connect to Postgres")?;
     let node = Node::connect(&rpc_url)?;
 
-    let (keys, output_index) = store::load_view_keys(&pool).await?;
+    let (keys, output_index, birthdays) = store::load_view_keys(&pool).await?;
     let view_keys = Arc::new(RwLock::new(keys));
     let output_index = Arc::new(RwLock::new(output_index));
+    let birthdays = Arc::new(RwLock::new(birthdays));
 
     let key_task = tokio::spawn(refresh_keys(
         pool.clone(),
         view_keys.clone(),
         output_index.clone(),
+        birthdays.clone(),
     ));
     let expiry_task = tokio::spawn(expire_mempool(pool.clone(), output_index.clone()));
-    let scanner_task = tokio::spawn(run_scanner(pool, view_keys, output_index, node));
+    let scanner_task = tokio::spawn(run_scanner(pool, view_keys, output_index, birthdays, node));
 
     tokio::select! {
         result = key_task => result.context("key-refresh task panicked")??,
@@ -65,11 +67,12 @@ async fn run_scanner(
     pool: PgPool,
     view_keys: Arc<RwLock<Vec<ViewKey>>>,
     output_index: Arc<RwLock<OutputIndex>>,
+    birthdays: Arc<RwLock<Birthdays>>,
     node: Node,
 ) -> Result<()> {
     loop {
-        catch_up(&pool, &view_keys, &output_index, &node).await?;
-        watch_mempool(&pool, &view_keys, &output_index, &node).await?;
+        catch_up(&pool, &view_keys, &output_index, &birthdays, &node).await?;
+        watch_mempool(&pool, &view_keys, &output_index, &birthdays, &node).await?;
     }
 }
 
@@ -78,12 +81,14 @@ async fn catch_up(
     pool: &PgPool,
     view_keys: &Arc<RwLock<Vec<ViewKey>>>,
     output_index: &Arc<RwLock<OutputIndex>>,
+    birthdays: &Arc<RwLock<Birthdays>>,
     node: &Node,
 ) -> Result<()> {
     loop {
         let tip = node.block_count().await?;
         let keys = view_keys.read().await.clone();
         let index = output_index.read().await.clone();
+        let birthdays = birthdays.read().await.clone();
 
         if keys.is_empty() {
             time::sleep(BLOCK_POLL).await;
@@ -92,7 +97,13 @@ async fn catch_up(
 
         let mut min_resume = u32::MAX;
         for vk in &keys {
-            let resume = store::resume_height(pool, &vk.recipient_address, &index).await?;
+            let table = index.get(&vk.recipient_address).context(format!(
+                "no reserve table configured for {}",
+                vk.recipient_address
+            ))?;
+            let birthday = birthdays.get(&vk.recipient_address).copied().flatten();
+            let max_confirmed = store::max_confirmed_height(pool, table).await?;
+            let resume = compute_resume_height(max_confirmed, birthday);
             min_resume = min_resume.min(resume);
         }
 
@@ -124,6 +135,7 @@ async fn watch_mempool(
     pool: &PgPool,
     view_keys: &Arc<RwLock<Vec<ViewKey>>>,
     output_index: &Arc<RwLock<OutputIndex>>,
+    birthdays: &Arc<RwLock<Birthdays>>,
     node: &Node,
 ) -> Result<()> {
     let indexer_url = std::env::var("NODE_INDEXER_GRPC_URL")
@@ -173,7 +185,7 @@ async fn watch_mempool(
                     }
                 }
                 _ = block_check.tick() => {
-                    if new_blocks_available(pool, view_keys, output_index, node).await? {
+                    if new_blocks_available(pool, view_keys, output_index, birthdays, node).await? {
                         return Ok(());
                     }
                 }
@@ -189,16 +201,24 @@ async fn new_blocks_available(
     pool: &PgPool,
     view_keys: &Arc<RwLock<Vec<ViewKey>>>,
     output_index: &Arc<RwLock<OutputIndex>>,
+    birthdays: &Arc<RwLock<Birthdays>>,
     node: &Node,
 ) -> Result<bool> {
     let keys = view_keys.read().await.clone();
     let index = output_index.read().await.clone();
+    let birthdays = birthdays.read().await.clone();
     if keys.is_empty() {
         return Ok(false);
     }
     let tip = node.block_count().await?;
     for vk in &keys {
-        let resume = store::resume_height(pool, &vk.recipient_address, &index).await?;
+        let table = index.get(&vk.recipient_address).context(format!(
+            "no reserve table configured for {}",
+            vk.recipient_address
+        ))?;
+        let birthday = birthdays.get(&vk.recipient_address).copied().flatten();
+        let max_confirmed = store::max_confirmed_height(pool, table).await?;
+        let resume = compute_resume_height(max_confirmed, birthday);
         if resume <= tip {
             return Ok(true);
         }
@@ -228,20 +248,33 @@ async fn scan_one_mempool_tx(
     Ok(())
 }
 
+/// Computes the height at which scanning should resume.
+///
+/// Uses `max(blockheight) - 100` from the reserve table if available, otherwise
+/// falls back to the per-view-key `birthday_height`, and finally to 0.
+fn compute_resume_height(max_confirmed: Option<i64>, birthday_height: Option<i64>) -> u32 {
+    max_confirmed
+        .map(|h| (h - 100).max(0) as u32)
+        .or_else(|| birthday_height.and_then(|h| u32::try_from(h).ok()))
+        .unwrap_or(0)
+}
+
 // ── Background tasks ───────────────────────────────────────────────────────
 
 async fn refresh_keys(
     pool: PgPool,
     view_keys: Arc<RwLock<Vec<ViewKey>>>,
     output_index: Arc<RwLock<OutputIndex>>,
+    birthdays: Arc<RwLock<Birthdays>>,
 ) -> Result<()> {
     let mut interval = time::interval(KEY_REFRESH);
     loop {
         interval.tick().await;
         match store::load_view_keys(&pool).await {
-            Ok((next_keys, next_index)) => {
+            Ok((next_keys, next_index, next_birthdays)) => {
                 *view_keys.write().await = next_keys;
                 *output_index.write().await = next_index;
+                *birthdays.write().await = next_birthdays;
             }
             Err(err) => error!(%err, "could not refresh view keys; retaining last good set"),
         }
