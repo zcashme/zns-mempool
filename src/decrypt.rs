@@ -5,11 +5,11 @@ use orchard::{
 };
 use sapling_crypto::{
     bundle::Bundle as SaplingBundle,
-    keys::PreparedIncomingViewingKey as PreparedSaplingIvk,
+    keys::{OutgoingViewingKey as SaplingOvk, PreparedIncomingViewingKey as PreparedSaplingIvk},
     note_encryption::{SaplingDomain, Zip212Enforcement},
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_note_encryption::try_note_decryption;
+use zcash_note_encryption::{try_note_decryption, try_output_recovery_with_ovk};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{consensus::MainNetwork, value::ZatBalance};
 use zip32::Scope;
@@ -60,6 +60,15 @@ pub fn decrypt_transaction(
     found
 }
 
+// ── Sapling ────────────────────────────────────────────────────────────────
+
+struct SaplingKeys {
+    recipient_address: String,
+    ivk_external: PreparedSaplingIvk,
+    ivk_internal: PreparedSaplingIvk,
+    ovk: SaplingOvk,
+}
+
 fn decrypt_sapling(
     bundle: &SaplingBundle<sapling_crypto::bundle::Authorized, ZatBalance>,
     view_keys: &[Wallet],
@@ -68,13 +77,14 @@ fn decrypt_sapling(
 ) {
     let zip212 = sapling_zip212_enforcement(effective_height);
     let domain = SaplingDomain::new(zip212);
-    let ivks = sapling_ivks(view_keys);
+    let keys = sapling_keys(view_keys);
 
     for (index, output) in bundle.shielded_outputs().iter().enumerate() {
-        for (recipient_address, ivk) in &ivks {
-            if let Some((note, _address, memo)) = try_note_decryption(&domain, ivk, output) {
+        for key in &keys {
+            // External IVK → incoming payment
+            if let Some((note, _, memo)) = try_note_decryption(&domain, &key.ivk_external, output) {
                 found.push(DecryptedShieldedOutput {
-                    recipient_address: recipient_address.clone(),
+                    recipient_address: key.recipient_address.clone(),
                     pool: "sapling",
                     output_index: index,
                     amount_zats: note.value().inner(),
@@ -83,28 +93,32 @@ fn decrypt_sapling(
                 });
                 break;
             }
-        }
-    }
-}
-
-fn decrypt_orchard_pool<V: DomainVersion>(
-    bundle: &Bundle<Authorized, ZatBalance>,
-    view_keys: &[Wallet],
-    pool_name: &'static str,
-    found: &mut Vec<DecryptedShieldedOutput>,
-) {
-    let ivks = orchard_ivks(view_keys);
-
-    for (index, action) in bundle.actions().iter().enumerate() {
-        let domain = NoteEncryptionDomain::<V>::for_action(action);
-        for (recipient_address, ivk) in &ivks {
-            if let Some((note, _address, memo)) = try_note_decryption(&domain, ivk, action) {
+            // Internal IVK → change (part of outgoing)
+            if let Some((note, _, memo)) = try_note_decryption(&domain, &key.ivk_internal, output) {
                 found.push(DecryptedShieldedOutput {
-                    recipient_address: recipient_address.clone(),
-                    pool: pool_name,
+                    recipient_address: key.recipient_address.clone(),
+                    pool: "sapling",
                     output_index: index,
                     amount_zats: note.value().inner(),
-                    is_outgoing: false,
+                    is_outgoing: true,
+                    memo,
+                });
+                break;
+            }
+            // OVK → outgoing spend
+            if let Some((note, _, memo)) = try_output_recovery_with_ovk(
+                &domain,
+                &key.ovk,
+                output,
+                output.cv(),
+                output.out_ciphertext(),
+            ) {
+                found.push(DecryptedShieldedOutput {
+                    recipient_address: key.recipient_address.clone(),
+                    pool: "sapling",
+                    output_index: index,
+                    amount_zats: note.value().inner(),
+                    is_outgoing: true,
                     memo,
                 });
                 break;
@@ -113,37 +127,107 @@ fn decrypt_orchard_pool<V: DomainVersion>(
     }
 }
 
+fn sapling_keys(view_keys: &[Wallet]) -> Vec<SaplingKeys> {
+    view_keys
+        .iter()
+        .filter_map(|vk| {
+            let dfvk = vk.ufvk.sapling()?;
+            Some(SaplingKeys {
+                recipient_address: vk.recipient_address.clone(),
+                ivk_external: PreparedSaplingIvk::new(&dfvk.to_ivk(Scope::External)),
+                ivk_internal: PreparedSaplingIvk::new(&dfvk.to_ivk(Scope::Internal)),
+                ovk: dfvk.fvk().ovk,
+            })
+        })
+        .collect()
+}
+
+// ── Orchard / Ironwood ─────────────────────────────────────────────────────
+
+struct OrchardKeys {
+    recipient_address: String,
+    ivk_external: PreparedOrchardIvk,
+    ivk_internal: PreparedOrchardIvk,
+    ovk: orchard::keys::OutgoingViewingKey,
+}
+
+fn decrypt_orchard_pool<V: DomainVersion>(
+    bundle: &Bundle<Authorized, ZatBalance>,
+    view_keys: &[Wallet],
+    pool_name: &'static str,
+    found: &mut Vec<DecryptedShieldedOutput>,
+) {
+    let keys = orchard_keys(view_keys);
+
+    for (index, action) in bundle.actions().iter().enumerate() {
+        let domain = NoteEncryptionDomain::<V>::for_action(action);
+        for key in &keys {
+            // External IVK → incoming payment
+            if let Some((note, _, memo)) = try_note_decryption(&domain, &key.ivk_external, action) {
+                found.push(DecryptedShieldedOutput {
+                    recipient_address: key.recipient_address.clone(),
+                    pool: pool_name,
+                    output_index: index,
+                    amount_zats: note.value().inner(),
+                    is_outgoing: false,
+                    memo,
+                });
+                break;
+            }
+            // Internal IVK → change (part of outgoing)
+            if let Some((note, _, memo)) = try_note_decryption(&domain, &key.ivk_internal, action) {
+                found.push(DecryptedShieldedOutput {
+                    recipient_address: key.recipient_address.clone(),
+                    pool: pool_name,
+                    output_index: index,
+                    amount_zats: note.value().inner(),
+                    is_outgoing: true,
+                    memo,
+                });
+                break;
+            }
+            // OVK → outgoing spend
+            if let Some((note, _, memo)) = try_output_recovery_with_ovk(
+                &domain,
+                &key.ovk,
+                action,
+                action.cv_net(),
+                &action.encrypted_note().out_ciphertext,
+            ) {
+                found.push(DecryptedShieldedOutput {
+                    recipient_address: key.recipient_address.clone(),
+                    pool: pool_name,
+                    output_index: index,
+                    amount_zats: note.value().inner(),
+                    is_outgoing: true,
+                    memo,
+                });
+                break;
+            }
+        }
+    }
+}
+
+fn orchard_keys(view_keys: &[Wallet]) -> Vec<OrchardKeys> {
+    view_keys
+        .iter()
+        .filter_map(|vk| {
+            let fvk = vk.ufvk.orchard()?;
+            Some(OrchardKeys {
+                recipient_address: vk.recipient_address.clone(),
+                ivk_external: fvk.to_ivk(Scope::External).prepare(),
+                ivk_internal: fvk.to_ivk(Scope::Internal).prepare(),
+                ovk: fvk.to_ovk(Scope::External),
+            })
+        })
+        .collect()
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
 fn sapling_zip212_enforcement(height: u32) -> Zip212Enforcement {
     zcash_primitives::transaction::components::sapling::zip212_enforcement(
         &MainNetwork,
         height.into(),
     )
-}
-
-fn sapling_ivks(view_keys: &[Wallet]) -> Vec<(String, PreparedSaplingIvk)> {
-    view_keys
-        .iter()
-        .filter_map(|vk| {
-            vk.ufvk.sapling().map(|dfvk| {
-                (
-                    vk.recipient_address.clone(),
-                    PreparedSaplingIvk::new(&dfvk.to_ivk(Scope::External)),
-                )
-            })
-        })
-        .collect()
-}
-
-fn orchard_ivks(view_keys: &[Wallet]) -> Vec<(String, PreparedOrchardIvk)> {
-    view_keys
-        .iter()
-        .filter_map(|vk| {
-            vk.ufvk.orchard().map(|fvk| {
-                (
-                    vk.recipient_address.clone(),
-                    fvk.to_ivk(Scope::External).prepare(),
-                )
-            })
-        })
-        .collect()
 }
