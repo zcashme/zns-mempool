@@ -20,7 +20,7 @@ use crate::store::OutputIndex;
 
 const BLOCK_POLL: Duration = Duration::from_secs(3);
 const KEY_REFRESH: Duration = Duration::from_secs(60);
-const MEMPOOL_EXPIRY_SECS: i64 = 21_600;
+const MEMPOOL_EXPIRY_SECS: i64 = 3_600;
 
 // ── Entry point ────────────────────────────────────────────────────────────
 

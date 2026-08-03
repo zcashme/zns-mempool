@@ -14,6 +14,7 @@ use crate::{decrypt::DecryptedShieldedOutput, decrypt::ViewKey};
 pub enum Status {
     Mempool,
     Confirmed,
+    Expired,
 }
 
 impl Status {
@@ -21,6 +22,7 @@ impl Status {
         match self {
             Self::Mempool => "mempool",
             Self::Confirmed => "confirmed",
+            Self::Expired => "expired",
         }
     }
 }

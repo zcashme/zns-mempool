@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::MainNetwork;
 
-use crate::{decrypt::ViewKey, scanner::DetectedOutput};
+use crate::{decrypt::ViewKey, scanner::DetectedOutput, scanner::Status};
 
 /// Maps `recipient_address` to the physical table where that account's outputs are written.
 pub type OutputIndex = HashMap<String, String>;
@@ -127,9 +127,11 @@ pub async fn expire_mempool(
     for name in unique_names {
         let result = sqlx::query(&format!(
             "update public.{name}
-             set status = 'expired'
-             where status = 'mempool'
-               and detected_at < now() - make_interval(secs => $1)"
+             set status = '{}'
+             where status = '{}'
+               and detected_at < now() - make_interval(secs => $1)",
+            Status::Expired.as_str(),
+            Status::Mempool.as_str(),
         ))
         .bind(expiry_seconds)
         .execute(pool)

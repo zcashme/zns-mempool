@@ -67,7 +67,7 @@ create table public.zn_shithole (
     amount_zats       bigint not null,
 
     status            text not null default 'mempool'
-        check (status in ('mempool', 'confirmed', 'orphaned', 'expired')),
+        check (status in ('mempool', 'confirmed', 'expired')),
 
     blockheight       bigint,
     detected_at       timestamptz not null default now(),
@@ -98,7 +98,7 @@ create table public.<table_name_you_choose> (
     amount_zats       bigint not null,
 
     status            text not null default 'mempool'
-        check (status in ('mempool', 'confirmed', 'orphaned', 'expired')),
+        check (status in ('mempool', 'confirmed', 'expired')),
 
     blockheight       bigint,
     detected_at       timestamptz not null default now(),

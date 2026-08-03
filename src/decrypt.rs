@@ -15,10 +15,6 @@ use zcash_protocol::{consensus::MainNetwork, value::ZatBalance};
 use zip32::Scope;
 
 /// A shielded output decrypted by one of the scanner's view keys.
-///
-/// `sender_address` is not populated because an IVK-only scanner cannot
-/// determine the external sender of a shielded payment. A sender address may be
-/// recoverable for transparent inputs via RPC, but this module does not do that.
 #[derive(Clone, Debug)]
 pub struct DecryptedShieldedOutput {
     pub recipient_address: String,
