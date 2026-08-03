@@ -74,8 +74,7 @@ async fn sync(db: &PgPool, wallets: &watch::Receiver<Vec<Wallet>>, node: &Node) 
         let wallets = wallets.borrow().clone();
 
         if wallets.is_empty() {
-            time::sleep(BLOCK_POLL).await;
-            continue;
+            return Ok(());
         }
 
         let mut min_resume = u32::MAX;
