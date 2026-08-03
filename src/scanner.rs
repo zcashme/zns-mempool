@@ -65,7 +65,8 @@ pub fn scan_mempool_tx(
     view_keys: &[ViewKey],
     chain_tip: u32,
 ) -> Result<Vec<DetectedOutput>> {
-    let tx = Transaction::read(Cursor::new(bytes), BranchId::Nu6_3)
+    let branch_id = BranchId::for_height(&MainNetwork, chain_tip.into());
+    let tx = Transaction::read(Cursor::new(bytes), branch_id)
         .context("failed to parse mempool transaction")?;
 
     // "Mempool height" used for trial decryption is chain_tip + 1.
