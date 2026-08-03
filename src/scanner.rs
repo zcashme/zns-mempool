@@ -6,12 +6,44 @@ use zcash_primitives::{block::Block, transaction::Transaction};
 use zcash_protocol::consensus::{BranchId, MainNetwork};
 use zcash_transparent::keys::IncomingViewingKey;
 
-use crate::{DetectedOutput, Status, decrypt::DecryptedShieldedOutput, decrypt::ViewKey};
+use crate::{decrypt::DecryptedShieldedOutput, decrypt::ViewKey};
+
+// ── Scanner output types ───────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Mempool,
+    Confirmed,
+}
+
+impl Status {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mempool => "mempool",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DetectedOutput {
+    pub recipient_address: String,
+    pub txid: String,
+    pub pool: &'static str,
+    pub output_index: i32,
+    pub amount_zats: i64,
+    pub memo: Option<String>,
+    pub status: Status,
+    pub blockheight: Option<i64>,
+}
+
+// ── Public entry points ────────────────────────────────────────────────────
 
 /// Scans a raw block for outputs decryptable by any view key.
 pub fn scan_block(bytes: &[u8], view_keys: &[ViewKey], height: u32) -> Result<Vec<DetectedOutput>> {
     let block = Block::read(Cursor::new(bytes), &MainNetwork).context("failed to parse block")?;
     let (_, transactions) = block.into_parts();
+
     let mut outputs = Vec::new();
     for tx in transactions {
         outputs.extend(scan_transaction(
@@ -19,8 +51,8 @@ pub fn scan_block(bytes: &[u8], view_keys: &[ViewKey], height: u32) -> Result<Ve
             view_keys,
             Status::Confirmed,
             height,
-            height,
-        )?);
+            Some(i64::from(height)),
+        ));
     }
     Ok(outputs)
 }
@@ -33,62 +65,96 @@ pub fn scan_mempool_tx(
 ) -> Result<Vec<DetectedOutput>> {
     let tx = Transaction::read(Cursor::new(bytes), BranchId::Nu6_3)
         .context("failed to parse mempool transaction")?;
+
     // "Mempool height" used for trial decryption is chain_tip + 1.
     let effective_height = chain_tip.saturating_add(1);
-    scan_transaction(&tx, view_keys, Status::Mempool, effective_height, chain_tip)
+
+    Ok(scan_transaction(
+        &tx,
+        view_keys,
+        Status::Mempool,
+        effective_height,
+        None,
+    ))
 }
+
+// ── Internal helpers ───────────────────────────────────────────────────────
 
 fn scan_transaction(
     tx: &Transaction,
     view_keys: &[ViewKey],
     status: Status,
     effective_height: u32,
-    chain_tip_or_height: u32,
-) -> Result<Vec<DetectedOutput>> {
+    blockheight: Option<i64>,
+) -> Vec<DetectedOutput> {
     if view_keys.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let txid = tx.txid().to_string();
-    let blockheight = if status == Status::Confirmed {
-        Some(i64::from(chain_tip_or_height))
-    } else {
-        None
+    let mut found =
+        scan_shielded_outputs(tx, view_keys, effective_height, &txid, status, blockheight);
+    found.extend(scan_transparent_outputs(
+        tx,
+        view_keys,
+        &txid,
+        status,
+        blockheight,
+    ));
+    found
+}
+
+fn scan_shielded_outputs(
+    tx: &Transaction,
+    view_keys: &[ViewKey],
+    effective_height: u32,
+    txid: &str,
+    status: Status,
+    blockheight: Option<i64>,
+) -> Vec<DetectedOutput> {
+    crate::decrypt::decrypt_transaction(tx, view_keys, effective_height)
+        .into_iter()
+        .map(|output| shielded_to_detected_output(output, txid, status, blockheight))
+        .collect()
+}
+
+fn scan_transparent_outputs(
+    tx: &Transaction,
+    view_keys: &[ViewKey],
+    txid: &str,
+    status: Status,
+    blockheight: Option<i64>,
+) -> Vec<DetectedOutput> {
+    let bundle = match tx.transparent_bundle() {
+        Some(bundle) => bundle,
+        None => return Vec::new(),
     };
 
-    let shielded = crate::decrypt::decrypt_transaction(tx, view_keys, effective_height);
-    let mut found: Vec<DetectedOutput> = shielded
-        .into_iter()
-        .map(|output| shielded_to_detected_output(output, &txid, status, blockheight))
-        .collect();
+    let index = transparent_index(view_keys);
+    if index.is_empty() {
+        return Vec::new();
+    }
 
-    // Transparent — match script_pubkey derived from UFVK at index 0.
-    // sender_address is empty because resolving it requires an RPC lookup.
-    if let Some(bundle) = tx.transparent_bundle() {
-        for (index, tx_out) in bundle.vout.iter().enumerate() {
-            let script = &tx_out.script_pubkey().0.0;
-            for vk in view_keys {
-                if let Some(our_script) = derive_transparent_script(&vk.ufvk)
-                    && script.as_slice() == our_script.as_slice()
-                {
-                    found.push(DetectedOutput {
-                        recipient_address: vk.recipient_address.clone(),
-                        txid: txid.clone(),
-                        pool: "transparent",
-                        output_index: index as i32,
-                        amount_zats: tx_out.value().into_u64() as i64,
-                        sender_address: String::new(),
-                        memo: None,
-                        status,
-                        blockheight,
-                    });
-                    break;
-                }
+    let mut found = Vec::new();
+    for (output_index, tx_out) in bundle.vout.iter().enumerate() {
+        let script = &tx_out.script_pubkey().0.0;
+        for (recipient_address, our_script) in &index {
+            if script.as_slice() == our_script.as_slice() {
+                found.push(DetectedOutput {
+                    recipient_address: recipient_address.clone(),
+                    txid: txid.to_owned(),
+                    pool: "transparent",
+                    output_index: output_index as i32,
+                    amount_zats: tx_out.value().into_u64() as i64,
+                    memo: None,
+                    status,
+                    blockheight,
+                });
+                break;
             }
         }
     }
-
-    Ok(found)
+    found
 }
 
 fn shielded_to_detected_output(
@@ -103,11 +169,20 @@ fn shielded_to_detected_output(
         pool: output.pool,
         output_index: output.output_index as i32,
         amount_zats: output.amount_zats as i64,
-        sender_address: output.sender_address,
         memo: std::str::from_utf8(&output.memo).ok().map(str::to_owned),
         status,
         blockheight,
     }
+}
+
+/// Pre-derived transparent scripts for each view key, used for fast matching.
+fn transparent_index(view_keys: &[ViewKey]) -> Vec<(String, Vec<u8>)> {
+    view_keys
+        .iter()
+        .filter_map(|vk| {
+            derive_transparent_script(&vk.ufvk).map(|script| (vk.recipient_address.clone(), script))
+        })
+        .collect()
 }
 
 fn derive_transparent_script(ufvk: &UnifiedFullViewingKey) -> Option<Vec<u8>> {

@@ -15,13 +15,16 @@ use zcash_protocol::{consensus::MainNetwork, value::ZatBalance};
 use zip32::Scope;
 
 /// A shielded output decrypted by one of the scanner's view keys.
+///
+/// `sender_address` is not populated because an IVK-only scanner cannot
+/// determine the external sender of a shielded payment. A sender address may be
+/// recoverable for transparent inputs via RPC, but this module does not do that.
 #[derive(Clone, Debug)]
 pub struct DecryptedShieldedOutput {
     pub recipient_address: String,
     pub pool: &'static str,
     pub output_index: usize,
     pub amount_zats: u64,
-    pub sender_address: String,
     pub memo: [u8; 512],
 }
 
@@ -70,13 +73,12 @@ fn decrypt_sapling(
 
     for (index, output) in bundle.shielded_outputs().iter().enumerate() {
         for (recipient_address, ivk) in &ivks {
-            if let Some((note, address, memo)) = try_note_decryption(&domain, ivk, output) {
+            if let Some((note, _address, memo)) = try_note_decryption(&domain, ivk, output) {
                 found.push(DecryptedShieldedOutput {
                     recipient_address: recipient_address.clone(),
                     pool: "sapling",
                     output_index: index,
                     amount_zats: note.value().inner(),
-                    sender_address: hex::encode(address.to_bytes()),
                     memo,
                 });
                 break;
@@ -96,13 +98,12 @@ fn decrypt_orchard_pool<V: DomainVersion>(
     for (index, action) in bundle.actions().iter().enumerate() {
         let domain = NoteEncryptionDomain::<V>::for_action(action);
         for (recipient_address, ivk) in &ivks {
-            if let Some((note, address, memo)) = try_note_decryption(&domain, ivk, action) {
+            if let Some((note, _address, memo)) = try_note_decryption(&domain, ivk, action) {
                 found.push(DecryptedShieldedOutput {
                     recipient_address: recipient_address.clone(),
                     pool: pool_name,
                     output_index: index,
                     amount_zats: note.value().inner(),
-                    sender_address: hex::encode(address.to_raw_address_bytes()),
                     memo,
                 });
                 break;

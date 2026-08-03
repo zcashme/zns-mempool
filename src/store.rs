@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::MainNetwork;
 
-use crate::{DetectedOutput, decrypt::ViewKey};
+use crate::{decrypt::ViewKey, scanner::DetectedOutput};
 
 /// Maps `recipient_address` to the physical table where that account's outputs are written.
 pub type OutputIndex = HashMap<String, String>;
@@ -87,8 +87,8 @@ pub async fn write_outputs(
         let sql = format!(
             "insert into public.{tbl} (
                 recipient_address, txid, pool, output_index, amount_zats,
-                sender_address, status, blockheight, detected_at, memo
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9)
+                status, blockheight, detected_at, memo
+             ) values ($1, $2, $3, $4, $5, $6, $7, now(), $8)
              on conflict (recipient_address, txid, pool, output_index) do update
              set status = case
                     when excluded.status = 'confirmed' then 'confirmed'
@@ -105,7 +105,6 @@ pub async fn write_outputs(
             .bind(output.pool)
             .bind(output.output_index)
             .bind(output.amount_zats)
-            .bind(&output.sender_address)
             .bind(output.status.as_str())
             .bind(output.blockheight)
             .bind(&output.memo)

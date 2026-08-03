@@ -16,36 +16,6 @@ use crate::chain::Node;
 use crate::decrypt::ViewKey;
 use crate::store::OutputIndex;
 
-// ── Types ──────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    Mempool,
-    Confirmed,
-}
-
-impl Status {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Mempool => "mempool",
-            Self::Confirmed => "confirmed",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DetectedOutput {
-    pub recipient_address: String,
-    pub txid: String,
-    pub pool: &'static str,
-    pub output_index: i32,
-    pub amount_zats: i64,
-    pub sender_address: String,
-    pub memo: Option<String>,
-    pub status: Status,
-    pub blockheight: Option<i64>,
-}
-
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const BLOCK_POLL: Duration = Duration::from_secs(3);

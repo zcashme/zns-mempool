@@ -33,7 +33,7 @@ create table public.zn_view_keys (
 
 | Column | Meaning |
 |--------|---------|
-| `recipient_address` | The Zcash address users pay to. Stable natural key. Also the link to the per-account reserve table. |
+| `recipient_address` | The operator-chosen account identity. Should correspond to the UFVK's unified address, but the scanner does not validate it. Also the link to the per-account reserve table. |
 | `view_key` | The canonical Unified Full Viewing Key (UFVK) the scanner uses to trial-decrypt. |
 | `reserve_table_name` | The exact physical table where outputs for this view key are written, e.g. `zn_shithole`. |
 | `label` | Optional human-readable name, e.g. `ops`, `treasury`, `shithole`. Used only for display/logging. |
@@ -65,7 +65,6 @@ create table public.zn_shithole (
         check (pool in ('sapling', 'orchard', 'ironwood', 'transparent')),
     output_index      int  not null,
     amount_zats       bigint not null,
-    sender_address    text not null,
 
     status            text not null default 'mempool'
         check (status in ('mempool', 'confirmed', 'orphaned', 'expired')),
@@ -97,7 +96,6 @@ create table public.<table_name_you_choose> (
         check (pool in ('sapling', 'orchard', 'ironwood', 'transparent')),
     output_index      int  not null,
     amount_zats       bigint not null,
-    sender_address    text not null,
 
     status            text not null default 'mempool'
         check (status in ('mempool', 'confirmed', 'orphaned', 'expired')),
@@ -124,7 +122,6 @@ create index idx_<table_name_you_choose>_blockheight
 | `pool` | Shielded pool or transparent. |
 | `output_index` | Output/action index within the transaction. |
 | `amount_zats` | Incoming amount in integer zatoshis. |
-| `sender_address` | The address that sent the payment. Always available, including for transparent UTXOs. |
 | `status` | `mempool`, `confirmed`, `orphaned`, or `expired`. |
 | `blockheight` | Block height where this output was mined. Null for mempool outputs. |
 | `detected_at` | When the scanner's own full node first saw the transaction. |
