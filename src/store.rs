@@ -1,36 +1,27 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::MainNetwork;
 
-use crate::{DetectedOutput, ViewKey};
+use crate::{DetectedOutput, decrypt::ViewKey};
 
-pub async fn connect(database_url: &str) -> Result<PgPool> {
-    PgPoolOptions::new()
-        .max_connections(5)
-        .connect(database_url)
-        .await
-        .context("failed to connect to Postgres")
-}
+/// Maps `recipient_address` to the physical table where that account's outputs are written.
+pub type OutputIndex = HashMap<String, String>;
 
-#[derive(sqlx::FromRow)]
-struct ViewKeyRow {
-    recipient_address: String,
-    view_key: String,
-    reserve_table_name: String,
-}
-
-pub async fn load_view_keys(pool: &PgPool) -> Result<Vec<ViewKey>> {
-    let rows: Vec<ViewKeyRow> = sqlx::query_as(
+pub async fn load_view_keys(pool: &PgPool) -> Result<(Vec<ViewKey>, OutputIndex)> {
+    let rows = sqlx::query!(
         "select recipient_address, view_key, reserve_table_name
          from public.zn_view_keys
-         where is_active = true",
+         where is_active = true"
     )
     .fetch_all(pool)
     .await
     .context("failed to load view keys")?;
 
     let mut keys = Vec::with_capacity(rows.len());
+    let mut output_index = OutputIndex::with_capacity(rows.len());
     for row in rows {
         let ufvk = UnifiedFullViewingKey::decode(&MainNetwork, &row.view_key).map_err(|e| {
             anyhow::anyhow!(
@@ -38,13 +29,13 @@ pub async fn load_view_keys(pool: &PgPool) -> Result<Vec<ViewKey>> {
                 recipient = row.recipient_address
             )
         })?;
+        output_index.insert(row.recipient_address.clone(), row.reserve_table_name);
         keys.push(ViewKey {
             recipient_address: row.recipient_address,
             ufvk,
-            reserve_table_name: row.reserve_table_name,
         });
     }
-    Ok(keys)
+    Ok((keys, output_index))
 }
 
 /// `max(blockheight) - 100` from the reserve table, falling back to
@@ -52,8 +43,12 @@ pub async fn load_view_keys(pool: &PgPool) -> Result<Vec<ViewKey>> {
 pub async fn resume_height(
     pool: &PgPool,
     recipient_address: &str,
-    reserve_table_name: &str,
+    output_index: &OutputIndex,
 ) -> Result<u32> {
+    let reserve_table_name = output_index.get(recipient_address).context(format!(
+        "no reserve table configured for {recipient_address}"
+    ))?;
+
     let max_height: Option<i64> = sqlx::query_scalar(&format!(
         "select max(blockheight) from public.{reserve_table_name} where status = 'confirmed'"
     ))
@@ -76,8 +71,19 @@ pub async fn resume_height(
     Ok(birthday.and_then(|h| u32::try_from(h).ok()).unwrap_or(0))
 }
 
-pub async fn write_outputs(pool: &PgPool, outputs: &[DetectedOutput]) -> Result<()> {
+pub async fn write_outputs(
+    pool: &PgPool,
+    outputs: &[DetectedOutput],
+    output_index: &OutputIndex,
+) -> Result<()> {
     for output in outputs {
+        let reserve_table_name = output_index
+            .get(&output.recipient_address)
+            .context(format!(
+                "no reserve table configured for {}",
+                output.recipient_address
+            ))?;
+
         let sql = format!(
             "insert into public.{tbl} (
                 recipient_address, txid, pool, output_index, amount_zats,
@@ -90,7 +96,7 @@ pub async fn write_outputs(pool: &PgPool, outputs: &[DetectedOutput]) -> Result<
                  end,
                  blockheight = coalesce(excluded.blockheight, {tbl}.blockheight),
                  memo = coalesce({tbl}.memo, excluded.memo)",
-            tbl = output.reserve_table_name,
+            tbl = reserve_table_name,
         );
 
         sqlx::query(&sql)
@@ -110,16 +116,16 @@ pub async fn write_outputs(pool: &PgPool, outputs: &[DetectedOutput]) -> Result<
     Ok(())
 }
 
-pub async fn expire_mempool(pool: &PgPool, expiry_seconds: i64) -> Result<u64> {
-    let table_names: Vec<String> = sqlx::query_scalar(
-        "select reserve_table_name from public.zn_view_keys where is_active = true",
-    )
-    .fetch_all(pool)
-    .await
-    .context("failed to load table names for expiry")?;
+pub async fn expire_mempool(
+    pool: &PgPool,
+    expiry_seconds: i64,
+    output_index: &OutputIndex,
+) -> Result<u64> {
+    use std::collections::HashSet;
 
     let mut total = 0u64;
-    for name in &table_names {
+    let unique_names: HashSet<&String> = output_index.values().collect();
+    for name in unique_names {
         let result = sqlx::query(&format!(
             "update public.{name}
              set status = 'expired'

@@ -1,17 +1,12 @@
-use std::collections::HashMap;
 use std::io::Cursor;
 
 use anyhow::{Context, Result};
-use zcash_client_backend::{TransferType, decrypt_transaction};
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::{block::Block, transaction::Transaction};
-use zcash_protocol::{
-    ShieldedPool,
-    consensus::{BlockHeight, BranchId, MainNetwork},
-};
+use zcash_protocol::consensus::{BranchId, MainNetwork};
 use zcash_transparent::keys::IncomingViewingKey;
 
-use crate::{DetectedOutput, Status, ViewKey};
+use crate::{DetectedOutput, Status, decrypt::DecryptedShieldedOutput, decrypt::ViewKey};
 
 /// Scans a raw block for outputs decryptable by any view key.
 pub fn scan_block(bytes: &[u8], view_keys: &[ViewKey], height: u32) -> Result<Vec<DetectedOutput>> {
@@ -23,7 +18,7 @@ pub fn scan_block(bytes: &[u8], view_keys: &[ViewKey], height: u32) -> Result<Ve
             &tx,
             view_keys,
             Status::Confirmed,
-            Some(height),
+            height,
             height,
         )?);
     }
@@ -38,97 +33,37 @@ pub fn scan_mempool_tx(
 ) -> Result<Vec<DetectedOutput>> {
     let tx = Transaction::read(Cursor::new(bytes), BranchId::Nu6_3)
         .context("failed to parse mempool transaction")?;
-    scan_transaction(&tx, view_keys, Status::Mempool, None, chain_tip)
+    // "Mempool height" used for trial decryption is chain_tip + 1.
+    let effective_height = chain_tip.saturating_add(1);
+    scan_transaction(&tx, view_keys, Status::Mempool, effective_height, chain_tip)
 }
 
 fn scan_transaction(
     tx: &Transaction,
     view_keys: &[ViewKey],
     status: Status,
-    height: Option<u32>,
-    chain_tip: u32,
+    effective_height: u32,
+    chain_tip_or_height: u32,
 ) -> Result<Vec<DetectedOutput>> {
     if view_keys.is_empty() {
         return Ok(Vec::new());
     }
 
-    let ufvks: HashMap<usize, UnifiedFullViewingKey> = view_keys
-        .iter()
-        .enumerate()
-        .map(|(i, vk)| (i, vk.ufvk.clone()))
+    let txid = tx.txid().to_string();
+    let blockheight = if status == Status::Confirmed {
+        Some(i64::from(chain_tip_or_height))
+    } else {
+        None
+    };
+
+    let shielded = crate::decrypt::decrypt_transaction(tx, view_keys, effective_height);
+    let mut found: Vec<DetectedOutput> = shielded
+        .into_iter()
+        .map(|output| shielded_to_detected_output(output, &txid, status, blockheight))
         .collect();
 
-    let decrypted = decrypt_transaction(
-        &MainNetwork,
-        height.map(BlockHeight::from),
-        Some(BlockHeight::from(chain_tip)),
-        tx,
-        &ufvks,
-    );
-
-    let txid = tx.txid().to_string();
-    let blockheight = height.map(i64::from);
-    let mut found = Vec::new();
-
-    for output in decrypted.sapling_outputs() {
-        if output.transfer_type() != TransferType::Incoming {
-            continue;
-        }
-        if let Some(vk) = view_keys.get(*output.account()) {
-            found.push(make_output(
-                vk,
-                &txid,
-                "sapling",
-                output.index(),
-                output.note().value().inner(),
-                output.memo().as_slice(),
-                &hex::encode(output.note().recipient().to_bytes()),
-                status,
-                blockheight,
-            ));
-        }
-    }
-
-    for output in decrypted.orchard_outputs() {
-        if output.transfer_type() != TransferType::Incoming {
-            continue;
-        }
-        if let Some(vk) = view_keys.get(*output.account()) {
-            found.push(make_output(
-                vk,
-                &txid,
-                shielded_pool_name(output.value_pool()),
-                output.index(),
-                output.note().0.value().inner(),
-                output.memo().as_slice(),
-                &hex::encode(output.note().0.recipient().to_raw_address_bytes()),
-                status,
-                blockheight,
-            ));
-        }
-    }
-
-    for output in decrypted.ironwood_outputs() {
-        if output.transfer_type() != TransferType::Incoming {
-            continue;
-        }
-        if let Some(vk) = view_keys.get(*output.account()) {
-            found.push(make_output(
-                vk,
-                &txid,
-                shielded_pool_name(output.value_pool()),
-                output.index(),
-                output.note().0.value().inner(),
-                output.memo().as_slice(),
-                &hex::encode(output.note().0.recipient().to_raw_address_bytes()),
-                status,
-                blockheight,
-            ));
-        }
-    }
-
     // Transparent — match script_pubkey derived from UFVK at index 0.
-    // sender_address is empty because the scanner is pure (no RPC).
+    // sender_address is empty because resolving it requires an RPC lookup.
     if let Some(bundle) = tx.transparent_bundle() {
         for (index, tx_out) in bundle.vout.iter().enumerate() {
             let script = &tx_out.script_pubkey().0.0;
@@ -138,7 +73,6 @@ fn scan_transaction(
                 {
                     found.push(DetectedOutput {
                         recipient_address: vk.recipient_address.clone(),
-                        reserve_table_name: vk.reserve_table_name.clone(),
                         txid: txid.clone(),
                         pool: "transparent",
                         output_index: index as i32,
@@ -155,6 +89,25 @@ fn scan_transaction(
     }
 
     Ok(found)
+}
+
+fn shielded_to_detected_output(
+    output: DecryptedShieldedOutput,
+    txid: &str,
+    status: Status,
+    blockheight: Option<i64>,
+) -> DetectedOutput {
+    DetectedOutput {
+        recipient_address: output.recipient_address,
+        txid: txid.to_owned(),
+        pool: output.pool,
+        output_index: output.output_index as i32,
+        amount_zats: output.amount_zats as i64,
+        sender_address: output.sender_address,
+        memo: std::str::from_utf8(&output.memo).ok().map(str::to_owned),
+        status,
+        blockheight,
+    }
 }
 
 fn derive_transparent_script(ufvk: &UnifiedFullViewingKey) -> Option<Vec<u8>> {
@@ -185,39 +138,5 @@ fn transparent_script_bytes(addr: &zcash_transparent::address::TransparentAddres
             script.push(0x87); // OP_EQUAL
             script
         }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn make_output(
-    vk: &ViewKey,
-    txid: &str,
-    pool: &'static str,
-    index: usize,
-    amount_zats: u64,
-    memo: &[u8],
-    address: &str,
-    status: Status,
-    blockheight: Option<i64>,
-) -> DetectedOutput {
-    DetectedOutput {
-        recipient_address: vk.recipient_address.clone(),
-        reserve_table_name: vk.reserve_table_name.clone(),
-        txid: txid.to_owned(),
-        pool,
-        output_index: index as i32,
-        amount_zats: amount_zats as i64,
-        sender_address: address.to_owned(),
-        memo: std::str::from_utf8(memo).ok().map(str::to_owned),
-        status,
-        blockheight,
-    }
-}
-
-fn shielded_pool_name(pool: ShieldedPool) -> &'static str {
-    match pool {
-        ShieldedPool::Sapling => "sapling",
-        ShieldedPool::Orchard => "orchard",
-        ShieldedPool::Ironwood => "ironwood",
     }
 }
