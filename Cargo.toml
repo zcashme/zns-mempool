@@ -1,0 +1,23 @@
+[package]
+name = "zns-scanner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+axum = "0.8"
+hex = "0.4"
+jsonrpsee = { version = "0.24", features = ["http-client"] }
+serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zebra-indexer-proto = "2.4.0"
+zcash_client_backend = { version = "=0.24.0-rc.6", default-features = false, features = ["orchard", "transparent-inputs"] }
+zcash_keys = { version = "=0.16.1", default-features = false, features = ["std", "sapling", "orchard", "transparent-inputs"] }
+zcash_primitives = "=0.30.0"
+zcash_protocol = "=0.10.3"
+zcash_transparent = "=0.10.0"
