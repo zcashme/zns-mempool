@@ -96,6 +96,16 @@ async fn sync(db: &PgPool, wallets: &watch::Receiver<Vec<Wallet>>, node: &Node) 
 
             if !outputs.is_empty() {
                 info!(height, outputs = outputs.len(), "scanned block");
+            } else if (height - min_resume) % 1000 == 0 || height == tip {
+                info!(
+                    height,
+                    min_resume,
+                    tip,
+                    progress_percent = ((height - min_resume) as f64 * 100.0
+                        / ((tip - min_resume).max(1) as f64))
+                        .round(),
+                    "sync progress"
+                );
             }
         }
 

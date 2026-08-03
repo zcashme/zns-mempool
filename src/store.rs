@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::consensus::MainNetwork;
+use zcash_protocol::{consensus::MainNetwork, memo::Memo};
 
 use crate::{decrypt::Wallet, scanner::DetectedOutput, scanner::Status};
 
@@ -89,10 +89,14 @@ pub async fn write_outputs(db: &PgPool, outputs: &[DetectedOutput]) -> Result<()
                  memo = coalesce({tbl}.memo, excluded.memo)",
             tbl = reserve_table_name,
         );
-        let memo = output
+        let memo: Option<String> = output
             .memo
             .as_ref()
-            .and_then(|memo| std::str::from_utf8(memo.as_array()).ok());
+            .and_then(|memo| Memo::try_from(memo).ok())
+            .and_then(|memo| match memo {
+                Memo::Text(text) => Some(text.replace('\0', "")),
+                _ => None,
+            });
 
         sqlx::query(&sql)
             .bind(&output.recipient_address)
