@@ -39,30 +39,28 @@ async fn main() -> Result<()> {
 
     let wallets = Arc::new(RwLock::new(store::load_view_keys(&pool).await?));
 
+    // Sync to chain tip before starting mempool watcher.
+    sync(&pool, &wallets, &node).await?;
+    info!("synced to chain tip");
+
     let key_task = tokio::spawn(refresh_keys(pool.clone(), wallets.clone()));
     let expiry_task = tokio::spawn(expire_mempool(pool.clone(), wallets.clone()));
-    let scanner_task = tokio::spawn(run_scanner(pool, wallets, node));
+    let block_task = tokio::spawn(watch_blocks(pool.clone(), wallets.clone(), node.clone()));
+    let mempool_task = tokio::spawn(watch_mempool(pool, wallets, node));
 
     tokio::select! {
         result = key_task => result.context("key-refresh task panicked")??,
         result = expiry_task => result.context("expiry task panicked")??,
-        result = scanner_task => result.context("scanner task panicked")??,
+        result = block_task => result.context("block watcher panicked")??,
+        result = mempool_task => result.context("mempool watcher panicked")??,
         signal = tokio::signal::ctrl_c() => signal.context("unable to listen for shutdown signal")?,
     }
     Ok(())
 }
 
-// ── Scanner loop: catch up to tip, then watch mempool ──────────────────────
+// ── Sync: scan blocks from resume height to chain tip ───────────────────────
 
-async fn run_scanner(pool: PgPool, wallets: Arc<RwLock<Vec<Wallet>>>, node: Node) -> Result<()> {
-    loop {
-        catch_up(&pool, &wallets, &node).await?;
-        watch_mempool(&pool, &wallets, &node).await?;
-    }
-}
-
-/// Scans blocks from the lowest resume height across all view keys until at chain tip.
-async fn catch_up(pool: &PgPool, wallets: &Arc<RwLock<Vec<Wallet>>>, node: &Node) -> Result<()> {
+async fn sync(pool: &PgPool, wallets: &Arc<RwLock<Vec<Wallet>>>, node: &Node) -> Result<()> {
     loop {
         let tip = node.block_count().await?;
         let wallets = wallets.read().await.clone();
@@ -102,16 +100,49 @@ async fn catch_up(pool: &PgPool, wallets: &Arc<RwLock<Vec<Wallet>>>, node: &Node
     }
 }
 
-/// Watches mempool via gRPC stream. Returns when new blocks are detected.
-async fn watch_mempool(
-    pool: &PgPool,
-    wallets: &Arc<RwLock<Vec<Wallet>>>,
-    node: &Node,
-) -> Result<()> {
+// ── Watch blocks: continuously scan new blocks ─────────────────────────────
+
+async fn watch_blocks(pool: PgPool, wallets: Arc<RwLock<Vec<Wallet>>>, node: Node) -> Result<()> {
+    loop {
+        time::sleep(BLOCK_POLL).await;
+
+        let tip = node.block_count().await?;
+        let wallets = wallets.read().await.clone();
+
+        if wallets.is_empty() {
+            continue;
+        }
+
+        let mut min_resume = u32::MAX;
+        for w in &wallets {
+            let max_confirmed = store::max_confirmed_height(&pool, &w.reserve_table_name).await?;
+            let resume = compute_resume_height(max_confirmed, w.birthday_height);
+            min_resume = min_resume.min(resume);
+        }
+
+        if min_resume > tip {
+            continue; // at tip, nothing new
+        }
+
+        for height in min_resume..=tip {
+            let hash = node.block_hash(height).await?;
+            let bytes = node.raw_block(&hash).await?;
+            let outputs = scanner::scan_block(&bytes, &wallets, height)?;
+            store::write_outputs(&pool, &outputs, &wallets).await?;
+
+            if !outputs.is_empty() {
+                info!(height, outputs = outputs.len(), "scanned block");
+            }
+        }
+    }
+}
+
+// ── Watch mempool: gRPC stream, runs forever ───────────────────────────────
+
+async fn watch_mempool(pool: PgPool, wallets: Arc<RwLock<Vec<Wallet>>>, node: Node) -> Result<()> {
     let indexer_url = std::env::var("NODE_INDEXER_GRPC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8230".to_owned());
     let mut seen = HashSet::new();
-    let mut block_check = time::interval(BLOCK_POLL);
 
     loop {
         let mut client = ZebraClient::connect(indexer_url.clone())
@@ -127,63 +158,34 @@ async fn watch_mempool(
             .into_inner();
 
         loop {
-            tokio::select! {
-                event = stream.message() => {
-                    match event {
-                        Err(err) => {
-                            warn!(%err, "mempool stream failed; reconnecting");
-                            break;
+            match stream.message().await {
+                Err(err) => {
+                    warn!(%err, "mempool stream failed; reconnecting");
+                    break;
+                }
+                Ok(Some(event)) => match ChangeType::try_from(event.change_type) {
+                    Ok(ChangeType::Added) => {
+                        let txid = hex::encode(event.tx_hash);
+                        let wallets = wallets.read().await.clone();
+                        let tip = node.block_count().await?;
+                        if let Err(err) =
+                            scan_one_mempool_tx(&pool, &wallets, &node, &txid, &mut seen, tip).await
+                        {
+                            warn!(%err, %txid, "could not scan mempool transaction");
                         }
-                        Ok(Some(event)) => match ChangeType::try_from(event.change_type) {
-                            Ok(ChangeType::Added) => {
-                                let txid = hex::encode(event.tx_hash);
-                                let wallets = wallets.read().await.clone();
-                                let tip = node.block_count().await?;
-                                if let Err(err) = scan_one_mempool_tx(
-                                    pool, &wallets, node, &txid, &mut seen, tip,
-                                ).await {
-                                    warn!(%err, %txid, "could not scan mempool transaction");
-                                }
-                            }
-                            Ok(ChangeType::Invalidated) | Ok(ChangeType::Mined) => {
-                                seen.remove(&hex::encode(event.tx_hash));
-                            }
-                            Err(_) => warn!(change_type = event.change_type, "unknown mempool event"),
-                        },
-                        Ok(None) => break,
                     }
-                }
-                _ = block_check.tick() => {
-                    if new_blocks_available(pool, wallets, node).await? {
-                        return Ok(());
+                    Ok(ChangeType::Invalidated) | Ok(ChangeType::Mined) => {
+                        seen.remove(&hex::encode(event.tx_hash));
                     }
-                }
+                    Err(_) => warn!(change_type = event.change_type, "unknown mempool event"),
+                },
+                Ok(None) => break,
             }
         }
 
         warn!("mempool stream ended; reconnecting");
         time::sleep(Duration::from_secs(5)).await;
     }
-}
-
-async fn new_blocks_available(
-    pool: &PgPool,
-    wallets: &Arc<RwLock<Vec<Wallet>>>,
-    node: &Node,
-) -> Result<bool> {
-    let wallets = wallets.read().await.clone();
-    if wallets.is_empty() {
-        return Ok(false);
-    }
-    let tip = node.block_count().await?;
-    for w in &wallets {
-        let max_confirmed = store::max_confirmed_height(pool, &w.reserve_table_name).await?;
-        let resume = compute_resume_height(max_confirmed, w.birthday_height);
-        if resume <= tip {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 async fn scan_one_mempool_tx(
