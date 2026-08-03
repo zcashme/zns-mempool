@@ -171,6 +171,27 @@ Worst case: the reserve table is truncated or missing and the scanner rescans fr
 
 ---
 
+## Key refresh via LISTEN/NOTIFY
+
+The scanner does not poll for config changes. Instead it listens on a Postgres NOTIFY channel. Add this trigger to `zn_view_keys` so the scanner refreshes instantly when you insert, update, or delete a row:
+
+```sql
+create or replace function notify_zn_view_keys_changed()
+returns trigger as $$
+begin
+    perform pg_notify('zn_view_keys_changed', '');
+    return null;
+end;
+$$ language plpgsql;
+
+create trigger zn_view_keys_changed
+after insert or update or delete
+on public.zn_view_keys
+for each statement execute function notify_zn_view_keys_changed();
+```
+
+---
+
 ## What the scanner does not store
 
 - No wallet state.

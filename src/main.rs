@@ -6,7 +6,7 @@ mod store;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgListener};
 use tokio::{sync::RwLock, time};
 use tonic::Request;
 use tracing::{error, info, warn};
@@ -17,8 +17,7 @@ use crate::decrypt::Wallet;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-const BLOCK_POLL: Duration = Duration::from_secs(3);
-const KEY_REFRESH: Duration = Duration::from_secs(60);
+const BLOCK_POLL: Duration = Duration::from_secs(10);
 const MEMPOOL_EXPIRY_SECS: i64 = 3_600;
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -43,7 +42,11 @@ async fn main() -> Result<()> {
     sync(&pool, &wallets, &node).await?;
     info!("synced to chain tip");
 
-    let key_task = tokio::spawn(refresh_keys(pool.clone(), wallets.clone()));
+    let key_task = tokio::spawn(refresh_keys(
+        database_url.clone(),
+        pool.clone(),
+        wallets.clone(),
+    ));
     let expiry_task = tokio::spawn(expire_mempool(pool.clone(), wallets.clone()));
     let block_task = tokio::spawn(watch_blocks(pool.clone(), wallets.clone(), node.clone()));
     let mempool_task = tokio::spawn(watch_mempool(pool, wallets, node));
@@ -222,12 +225,28 @@ fn compute_resume_height(max_confirmed: Option<i64>, birthday_height: Option<i64
 
 // ── Background tasks ───────────────────────────────────────────────────────
 
-async fn refresh_keys(pool: PgPool, wallets: Arc<RwLock<Vec<Wallet>>>) -> Result<()> {
-    let mut interval = time::interval(KEY_REFRESH);
+async fn refresh_keys(
+    database_url: String,
+    pool: PgPool,
+    wallets: Arc<RwLock<Vec<Wallet>>>,
+) -> Result<()> {
+    let mut listener = PgListener::connect(&database_url)
+        .await
+        .context("failed to connect PgListener")?;
+    listener
+        .listen("zn_view_keys_changed")
+        .await
+        .context("failed to LISTEN")?;
+
+    info!("listening for zn_view_keys changes");
+
     loop {
-        interval.tick().await;
+        listener.recv().await.context("PgListener recv failed")?;
         match store::load_view_keys(&pool).await {
-            Ok(next) => *wallets.write().await = next,
+            Ok(next) => {
+                *wallets.write().await = next;
+                info!("wallets refreshed via NOTIFY");
+            }
             Err(err) => error!(%err, "could not refresh view keys; retaining last good set"),
         }
     }
