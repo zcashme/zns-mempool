@@ -3987,12 +3987,12 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 name = "zns-scanner"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "hex",
  "jsonrpsee",
  "serde",
  "sqlx",
- "thiserror 2.0.19",
  "tokio",
  "tonic",
  "tracing",

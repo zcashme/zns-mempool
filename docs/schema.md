@@ -23,7 +23,7 @@ Single source of truth for what the scanner watches.
 create table public.zn_view_keys (
     recipient_address   text primary key,
     view_key            text not null unique,
-    reserve_table_name  text not null,
+    reserve_table_name  text not null check (reserve_table_name ~ '^[a-zA-Z_][a-zA-Z0-9_]*$'),
     label               text,
     birthday_height     bigint,
     is_active           boolean not null default true,
