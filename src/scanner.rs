@@ -46,11 +46,14 @@ pub fn scan_block(bytes: &[u8], view_keys: &[ViewKey], height: u32) -> Result<Ve
     let block = Block::read(Cursor::new(bytes), &MainNetwork).context("failed to parse block")?;
     let (_, transactions) = block.into_parts();
 
+    let t_index = transparent_index(view_keys);
+
     let mut outputs = Vec::new();
     for tx in transactions {
         outputs.extend(scan_transaction(
             &tx,
             view_keys,
+            &t_index,
             Status::Confirmed,
             height,
             Some(i64::from(height)),
@@ -71,10 +74,12 @@ pub fn scan_mempool_tx(
 
     // "Mempool height" used for trial decryption is chain_tip + 1.
     let effective_height = chain_tip.saturating_add(1);
+    let t_index = transparent_index(view_keys);
 
     Ok(scan_transaction(
         &tx,
         view_keys,
+        &t_index,
         Status::Mempool,
         effective_height,
         None,
@@ -86,6 +91,7 @@ pub fn scan_mempool_tx(
 fn scan_transaction(
     tx: &Transaction,
     view_keys: &[ViewKey],
+    t_index: &[(String, Vec<u8>)],
     status: Status,
     effective_height: u32,
     blockheight: Option<i64>,
@@ -99,7 +105,7 @@ fn scan_transaction(
         scan_shielded_outputs(tx, view_keys, effective_height, &txid, status, blockheight);
     found.extend(scan_transparent_outputs(
         tx,
-        view_keys,
+        t_index,
         &txid,
         status,
         blockheight,
@@ -123,7 +129,7 @@ fn scan_shielded_outputs(
 
 fn scan_transparent_outputs(
     tx: &Transaction,
-    view_keys: &[ViewKey],
+    t_index: &[(String, Vec<u8>)],
     txid: &str,
     status: Status,
     blockheight: Option<i64>,
@@ -133,15 +139,14 @@ fn scan_transparent_outputs(
         None => return Vec::new(),
     };
 
-    let index = transparent_index(view_keys);
-    if index.is_empty() {
+    if t_index.is_empty() {
         return Vec::new();
     }
 
     let mut found = Vec::new();
     for (output_index, tx_out) in bundle.vout.iter().enumerate() {
         let script = &tx_out.script_pubkey().0.0;
-        for (recipient_address, our_script) in &index {
+        for (recipient_address, our_script) in t_index {
             if script.as_slice() == our_script.as_slice() {
                 found.push(DetectedOutput {
                     recipient_address: recipient_address.clone(),
