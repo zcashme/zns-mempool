@@ -3,20 +3,11 @@ mod decrypt;
 mod scanner;
 mod store;
 
-use std::{
-    collections::HashSet,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use axum::{Json, Router, extract::State, routing::get};
-use serde::Serialize;
 use sqlx::PgPool;
-use tokio::{net::TcpListener, sync::RwLock, time};
+use tokio::{sync::RwLock, time};
 use tonic::Request;
 use tracing::{error, info, warn};
 use zebra_indexer_proto::{Empty, ZebraClient, mempool_change_message::ChangeType};
@@ -60,24 +51,6 @@ pub struct DetectedOutput {
 const BLOCK_POLL: Duration = Duration::from_secs(3);
 const KEY_REFRESH: Duration = Duration::from_secs(60);
 const MEMPOOL_EXPIRY_SECS: i64 = 21_600;
-const HEALTH_BIND: &str = "127.0.0.1:9090";
-
-// ── Health ─────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Default)]
-struct Health {
-    keys_loaded: Arc<AtomicUsize>,
-    last_scanned_height: Arc<AtomicU64>,
-    mempool_events: Arc<AtomicU64>,
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    ok: bool,
-    keys_loaded: usize,
-    last_scanned_height: u64,
-    mempool_events: u64,
-}
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
@@ -98,29 +71,16 @@ async fn main() -> Result<()> {
     let (keys, output_index) = store::load_view_keys(&pool).await?;
     let view_keys = Arc::new(RwLock::new(keys));
     let output_index = Arc::new(RwLock::new(output_index));
-    let health = Health::default();
-    health
-        .keys_loaded
-        .store(view_keys.read().await.len(), Ordering::Relaxed);
 
-    let health_task = tokio::spawn(run_health(health.clone()));
     let key_task = tokio::spawn(refresh_keys(
         pool.clone(),
         view_keys.clone(),
         output_index.clone(),
-        health.clone(),
     ));
     let expiry_task = tokio::spawn(expire_mempool(pool.clone(), output_index.clone()));
-    let scanner_task = tokio::spawn(run_scanner(
-        pool,
-        view_keys,
-        output_index,
-        node,
-        health.clone(),
-    ));
+    let scanner_task = tokio::spawn(run_scanner(pool, view_keys, output_index, node));
 
     tokio::select! {
-        result = health_task => result.context("health task panicked")??,
         result = key_task => result.context("key-refresh task panicked")??,
         result = expiry_task => result.context("expiry task panicked")??,
         result = scanner_task => result.context("scanner task panicked")??,
@@ -136,11 +96,10 @@ async fn run_scanner(
     view_keys: Arc<RwLock<Vec<ViewKey>>>,
     output_index: Arc<RwLock<OutputIndex>>,
     node: Node,
-    health: Health,
 ) -> Result<()> {
     loop {
-        catch_up(&pool, &view_keys, &output_index, &node, &health).await?;
-        watch_mempool(&pool, &view_keys, &output_index, &node, &health).await?;
+        catch_up(&pool, &view_keys, &output_index, &node).await?;
+        watch_mempool(&pool, &view_keys, &output_index, &node).await?;
     }
 }
 
@@ -150,7 +109,6 @@ async fn catch_up(
     view_keys: &Arc<RwLock<Vec<ViewKey>>>,
     output_index: &Arc<RwLock<OutputIndex>>,
     node: &Node,
-    health: &Health,
 ) -> Result<()> {
     loop {
         let tip = node.block_count().await?;
@@ -178,10 +136,6 @@ async fn catch_up(
             let outputs = scanner::scan_block(&bytes, &keys, height)?;
             store::write_outputs(pool, &outputs, &index).await?;
 
-            health
-                .last_scanned_height
-                .store(u64::from(height), Ordering::Relaxed);
-
             if !outputs.is_empty() {
                 info!(height, outputs = outputs.len(), "scanned block");
             }
@@ -201,7 +155,6 @@ async fn watch_mempool(
     view_keys: &Arc<RwLock<Vec<ViewKey>>>,
     output_index: &Arc<RwLock<OutputIndex>>,
     node: &Node,
-    health: &Health,
 ) -> Result<()> {
     let indexer_url = std::env::var("NODE_INDEXER_GRPC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8230".to_owned());
@@ -236,7 +189,7 @@ async fn watch_mempool(
                                 let index = output_index.read().await.clone();
                                 let tip = node.block_count().await?;
                                 if let Err(err) = scan_one_mempool_tx(
-                                    pool, &keys, &index, node, &txid, &mut seen, tip, health,
+                                    pool, &keys, &index, node, &txid, &mut seen, tip,
                                 ).await {
                                     warn!(%err, %txid, "could not scan mempool transaction");
                                 }
@@ -283,7 +236,6 @@ async fn new_blocks_available(
     Ok(false)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn scan_one_mempool_tx(
     pool: &PgPool,
     keys: &[ViewKey],
@@ -292,7 +244,6 @@ async fn scan_one_mempool_tx(
     txid: &str,
     seen: &mut HashSet<String>,
     tip: u32,
-    health: &Health,
 ) -> Result<()> {
     if seen.contains(txid) {
         return Ok(());
@@ -301,7 +252,6 @@ async fn scan_one_mempool_tx(
     let outputs = scanner::scan_mempool_tx(&bytes, keys, tip)?;
     store::write_outputs(pool, &outputs, output_index).await?;
     seen.insert(txid.to_owned());
-    health.mempool_events.fetch_add(1, Ordering::Relaxed);
     if !outputs.is_empty() {
         info!(%txid, outputs = outputs.len(), "detected mempool payment");
     }
@@ -310,38 +260,16 @@ async fn scan_one_mempool_tx(
 
 // ── Background tasks ───────────────────────────────────────────────────────
 
-async fn run_health(health: Health) -> Result<()> {
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .with_state(health);
-    let listener = TcpListener::bind(HEALTH_BIND).await?;
-    info!(%HEALTH_BIND, "health endpoint listening");
-    axum::serve(listener, app)
-        .await
-        .context("health server failed")
-}
-
-async fn health_handler(State(health): State<Health>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
-        keys_loaded: health.keys_loaded.load(Ordering::Relaxed),
-        last_scanned_height: health.last_scanned_height.load(Ordering::Relaxed),
-        mempool_events: health.mempool_events.load(Ordering::Relaxed),
-    })
-}
-
 async fn refresh_keys(
     pool: PgPool,
     view_keys: Arc<RwLock<Vec<ViewKey>>>,
     output_index: Arc<RwLock<OutputIndex>>,
-    health: Health,
 ) -> Result<()> {
     let mut interval = time::interval(KEY_REFRESH);
     loop {
         interval.tick().await;
         match store::load_view_keys(&pool).await {
             Ok((next_keys, next_index)) => {
-                health.keys_loaded.store(next_keys.len(), Ordering::Relaxed);
                 *view_keys.write().await = next_keys;
                 *output_index.write().await = next_index;
             }

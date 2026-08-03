@@ -6,12 +6,10 @@ rust-version = "1.88"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8"
 hex = "0.4"
 jsonrpsee = { version = "0.24", features = ["http-client"] }
 orchard = "=0.15.4"
 sapling-crypto = "=0.7.0"
-serde = { version = "1", features = ["derive"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = "0.14"
