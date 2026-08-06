@@ -125,24 +125,14 @@ async fn sync(db: &PgPool, wallets: &[Wallet], node: &Node) -> Result<u32> {
 // ── Watch blocks: continuously scan new blocks ─────────────────────────────
 
 /// Incremental block watcher: scan new blocks from last_tip - 100 (reorg margin).
-/// If wallets changed, falls back to a full sync().
 async fn watch_blocks(
     db: PgPool,
-    mut wallets: watch::Receiver<Vec<Wallet>>,
+    wallets: watch::Receiver<Vec<Wallet>>,
     node: Node,
     mut last_tip: u32,
 ) -> Result<()> {
     loop {
         time::sleep(BLOCK_POLL).await;
-
-        // Wallet config changed — do a full re-sync from the new min_resume.
-        if wallets.has_changed().unwrap_or(false) {
-            info!("wallets changed, re-syncing from scratch");
-            let wallet_snapshot = wallets.borrow_and_update().clone();
-            last_tip = sync(&db, &wallet_snapshot, &node).await?;
-            info!(last_tip, "re-synced to chain tip");
-            continue;
-        }
 
         let tip = node.block_count().await?;
         let from = last_tip.min(tip).saturating_sub(100);
