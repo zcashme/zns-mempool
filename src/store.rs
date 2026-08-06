@@ -76,15 +76,16 @@ pub async fn write_outputs(db: &PgPool, outputs: &[DetectedOutput]) -> Result<()
         ))?;
         let sql = format!(
             "insert into public.{tbl} (
-                recipient_address, txid, pool, output_index, amount_zats,
+                recipient_address, txid, pool, amount_zats,
                 is_outgoing, status, blockheight, detected_at, memo
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9)
-             on conflict (recipient_address, txid, pool, output_index) do update
+             ) values ($1, $2, $3, $4, $5, $6, $7, now(), $8)
+             on conflict (recipient_address, txid, is_outgoing) do update
              set status = case
                     when excluded.status = 'confirmed' then 'confirmed'
                     else {tbl}.status
                  end,
-                 is_outgoing = excluded.is_outgoing,
+                 pool = excluded.pool,
+                 amount_zats = excluded.amount_zats,
                  blockheight = coalesce(excluded.blockheight, {tbl}.blockheight),
                  memo = coalesce({tbl}.memo, excluded.memo)",
             tbl = reserve_table_name,
@@ -101,8 +102,7 @@ pub async fn write_outputs(db: &PgPool, outputs: &[DetectedOutput]) -> Result<()
         sqlx::query(&sql)
             .bind(&output.recipient_address)
             .bind(&output.txid)
-            .bind(output.pool)
-            .bind(output.output_index)
+            .bind(&output.pool)
             .bind(output.amount_zats)
             .bind(output.is_outgoing)
             .bind(output.status.as_str())

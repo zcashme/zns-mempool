@@ -19,7 +19,6 @@ use zip32::Scope;
 pub struct DecryptedShieldedOutput {
     pub recipient_address: String,
     pub pool: &'static str,
-    pub output_index: usize,
     pub amount_zats: u64,
     pub is_outgoing: bool,
     pub memo: MemoBytes,
@@ -79,33 +78,31 @@ fn decrypt_sapling(
     let domain = SaplingDomain::new(zip212);
     let keys = sapling_keys(view_keys);
 
-    for (index, output) in bundle.shielded_outputs().iter().enumerate() {
+    for output in bundle.shielded_outputs().iter() {
         for key in &keys {
             // External IVK → incoming payment
             if let Some((note, _, memo)) = try_note_decryption(&domain, &key.ivk_external, output) {
                 found.push(DecryptedShieldedOutput {
                     recipient_address: key.recipient_address.clone(),
                     pool: "sapling",
-                    output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: false,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
-                break;
+                continue;
             }
             // Internal IVK → change (part of outgoing)
             if let Some((note, _, memo)) = try_note_decryption(&domain, &key.ivk_internal, output) {
                 found.push(DecryptedShieldedOutput {
                     recipient_address: key.recipient_address.clone(),
                     pool: "sapling",
-                    output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
-                break;
+                continue;
             }
             // OVK → outgoing spend
             if let Some((note, _, memo)) = try_output_recovery_with_ovk(
@@ -118,13 +115,12 @@ fn decrypt_sapling(
                 found.push(DecryptedShieldedOutput {
                     recipient_address: key.recipient_address.clone(),
                     pool: "sapling",
-                    output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
-                break;
+                continue;
             }
         }
     }
@@ -162,7 +158,7 @@ fn decrypt_orchard_pool<V: DomainVersion>(
 ) {
     let keys = orchard_keys(view_keys);
 
-    for (index, action) in bundle.actions().iter().enumerate() {
+    for action in bundle.actions().iter() {
         let domain = NoteEncryptionDomain::<V>::for_action(action);
         for key in &keys {
             // External IVK → incoming payment
@@ -170,26 +166,24 @@ fn decrypt_orchard_pool<V: DomainVersion>(
                 found.push(DecryptedShieldedOutput {
                     recipient_address: key.recipient_address.clone(),
                     pool: pool_name,
-                    output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: false,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
-                break;
+                continue;
             }
             // Internal IVK → change (part of outgoing)
             if let Some((note, _, memo)) = try_note_decryption(&domain, &key.ivk_internal, action) {
                 found.push(DecryptedShieldedOutput {
                     recipient_address: key.recipient_address.clone(),
                     pool: pool_name,
-                    output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
-                break;
+                continue;
             }
             // OVK → outgoing spend
             if let Some((note, _, memo)) = try_output_recovery_with_ovk(
@@ -202,13 +196,12 @@ fn decrypt_orchard_pool<V: DomainVersion>(
                 found.push(DecryptedShieldedOutput {
                     recipient_address: key.recipient_address.clone(),
                     pool: pool_name,
-                    output_index: index,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
-                break;
+                continue;
             }
         }
     }

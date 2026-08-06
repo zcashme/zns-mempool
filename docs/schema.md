@@ -61,9 +61,7 @@ create table public.zn_shithole (
         references public.zn_view_keys(recipient_address),
 
     txid              text not null,
-    pool              text not null
-        check (pool in ('sapling', 'orchard', 'ironwood', 'transparent')),
-    output_index      int  not null,
+    pool              text not null,
     amount_zats       bigint not null,
     is_outgoing       boolean not null default false,
 
@@ -75,7 +73,7 @@ create table public.zn_shithole (
 
     memo              text,
 
-    primary key (recipient_address, txid, pool, output_index)
+    primary key (recipient_address, txid, is_outgoing)
 );
 
 create index idx_zn_shithole_status_time
@@ -93,9 +91,7 @@ create table public.<table_name_you_choose> (
         references public.zn_view_keys(recipient_address),
 
     txid              text not null,
-    pool              text not null
-        check (pool in ('sapling', 'orchard', 'ironwood', 'transparent')),
-    output_index      int  not null,
+    pool              text not null,
     amount_zats       bigint not null,
     is_outgoing       boolean not null default false,
 
@@ -107,7 +103,7 @@ create table public.<table_name_you_choose> (
 
     memo              text,
 
-    primary key (recipient_address, txid, pool, output_index)
+    primary key (recipient_address, txid, is_outgoing)
 );
 
 create index idx_<table_name_you_choose>_status_time
@@ -121,16 +117,15 @@ create index idx_<table_name_you_choose>_blockheight
 |--------|---------|
 | `recipient_address` | Foreign key to `zn_view_keys`. Every row in this table has the same value. |
 | `txid` | Transaction id, hex-encoded. |
-| `pool` | Shielded pool or transparent. |
-| `output_index` | Output/action index within the transaction. |
-| `amount_zats` | Amount in integer zatoshis. |
+| `pool` | Shielded pool(s) involved: `sapling`, `orchard`, `ironwood`, `transparent`, or `+`-joined for multi-pool (e.g. `orchard+sapling`). |
+| `amount_zats` | Total amount in integer zatoshis, summed across all outputs in this direction. |
 | `is_outgoing` | `false` = incoming payment (external IVK). `true` = outgoing spend or change (OVK / internal IVK). |
 | `status` | `mempool`, `confirmed`, or `expired`. |
 | `blockheight` | Block height where this output was mined. Null for mempool outputs. |
 | `detected_at` | When the scanner's own full node first saw the transaction. |
 | `memo` | Decoded payment memo, if any. |
 
-Primary key identity: one transaction can pay the same account multiple times across different pools or output indices, so `(recipient_address, txid, pool, output_index)` is the smallest unique key.
+Primary key identity: one transaction can have both incoming and outgoing sides for the same account, so `(recipient_address, txid, is_outgoing)` is the smallest unique key. Multiple outputs in the same direction (including across pools) are aggregated into a single row.
 
 ---
 

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use anyhow::{Context, Result};
@@ -34,8 +35,7 @@ impl Status {
 pub struct DetectedOutput {
     pub recipient_address: String,
     pub txid: String,
-    pub pool: &'static str,
-    pub output_index: i32,
+    pub pool: String,
     pub amount_zats: i64,
     pub is_outgoing: bool,
     pub memo: Option<MemoBytes>,
@@ -114,7 +114,42 @@ fn scan_transaction(
         status,
         blockheight,
     ));
-    found
+    aggregate_outputs(found)
+}
+
+/// Aggregates detected outputs by (recipient_address, txid, is_outgoing),
+/// summing amounts and joining pool names with "+".
+fn aggregate_outputs(outputs: Vec<DetectedOutput>) -> Vec<DetectedOutput> {
+    let mut groups: HashMap<(String, String, bool), Vec<DetectedOutput>> = HashMap::new();
+    for output in outputs {
+        let key = (output.recipient_address.clone(), output.txid.clone(), output.is_outgoing);
+        groups.entry(key).or_default().push(output);
+    }
+
+    let mut result = Vec::with_capacity(groups.len());
+    for (_, group) in groups {
+        let amount_zats: i64 = group.iter().map(|o| o.amount_zats).sum();
+        let pools: Vec<String> = {
+            let set: HashSet<String> = group.iter().map(|o| o.pool.clone()).collect();
+            let mut v: Vec<String> = set.into_iter().collect();
+            v.sort();
+            v
+        };
+        let pool = pools.join("+");
+        let memo = group.iter().find_map(|o| o.memo.clone());
+        let first = group.into_iter().next().unwrap();
+        result.push(DetectedOutput {
+            recipient_address: first.recipient_address,
+            txid: first.txid,
+            pool,
+            amount_zats,
+            is_outgoing: first.is_outgoing,
+            memo,
+            status: first.status,
+            blockheight: first.blockheight,
+        });
+    }
+    result
 }
 
 fn scan_shielded_outputs(
@@ -148,15 +183,14 @@ fn scan_transparent_outputs(
     }
 
     let mut found = Vec::new();
-    for (output_index, tx_out) in bundle.vout.iter().enumerate() {
+    for tx_out in bundle.vout.iter() {
         let script = &tx_out.script_pubkey().0.0;
         for (recipient_address, our_script) in t_index {
             if script.as_slice() == our_script.as_slice() {
                 found.push(DetectedOutput {
                     recipient_address: recipient_address.clone(),
                     txid: txid.to_owned(),
-                    pool: "transparent",
-                    output_index: output_index as i32,
+                    pool: "transparent".to_string(),
                     amount_zats: tx_out.value().into_u64() as i64,
                     is_outgoing: false,
                     memo: None,
@@ -179,8 +213,7 @@ fn shielded_to_detected_output(
     DetectedOutput {
         recipient_address: output.recipient_address,
         txid: txid.to_owned(),
-        pool: output.pool,
-        output_index: output.output_index as i32,
+        pool: output.pool.to_string(),
         amount_zats: output.amount_zats as i64,
         is_outgoing: output.is_outgoing,
         memo: Some(output.memo),
