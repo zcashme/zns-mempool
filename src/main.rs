@@ -48,12 +48,13 @@ async fn main() -> Result<()> {
         wallet_updates,
     ));
 
-    // Sync to chain tip before starting mempool watcher.
-    sync(&db, &wallets, &node).await?;
+    // Sync to chain tip before starting incremental watchers.
+    let initial_wallets = wallets.borrow().clone();
+    let last_tip = sync(&db, &initial_wallets, &node).await?;
     info!("synced to chain tip");
 
     let expiry_task = tokio::spawn(expire_mempool(db.clone()));
-    let block_task = tokio::spawn(watch_blocks(db.clone(), wallets.clone(), node.clone()));
+    let block_task = tokio::spawn(watch_blocks(db.clone(), wallets.clone(), node.clone(), last_tip));
     let mempool_task = tokio::spawn(watch_mempool(db, wallets, node));
 
     tokio::select! {
@@ -68,60 +69,99 @@ async fn main() -> Result<()> {
 
 // ── Sync: scan blocks from resume height to chain tip ───────────────────────
 
-async fn sync(db: &PgPool, wallets: &watch::Receiver<Vec<Wallet>>, node: &Node) -> Result<()> {
+/// Full sync: compute min_resume from the database, scan to chain tip.
+/// Called once on startup and when wallets change.  Returns the tip reached.
+async fn sync(db: &PgPool, wallets: &[Wallet], node: &Node) -> Result<u32> {
+    if wallets.is_empty() {
+        return Ok(node.block_count().await?);
+    }
+
+    // Starting point: the lowest max(blockheight) across all wallets, minus 100
+    // for reorg safety.  Empty tables fall back to birthday_height.
+    let mut min_resume = u32::MAX;
+    for w in wallets {
+        let max_confirmed = store::max_confirmed_height(db, &w.reserve_table_name).await?;
+        let resume = match max_confirmed {
+            Some(h) => (h - 100).max(0) as u32,
+            None => w
+                .birthday_height
+                .and_then(|h| u32::try_from(h).ok())
+                .unwrap_or(0),
+        };
+        min_resume = min_resume.min(resume);
+    }
+
+    let mut height = min_resume;
     loop {
         let tip = node.block_count().await?;
-        let wallets = wallets.borrow().clone();
-
-        if wallets.is_empty() {
-            return Ok(());
+        if height > tip {
+            return Ok(tip);
         }
-
-        let mut min_resume = u32::MAX;
-        for w in &wallets {
-            let max_confirmed = store::max_confirmed_height(db, &w.reserve_table_name).await?;
-            let resume = compute_resume_height(max_confirmed, w.birthday_height);
-            min_resume = min_resume.min(resume);
-        }
-
-        if min_resume > tip {
-            return Ok(()); // at tip
-        }
-
-        for height in min_resume..=tip {
-            let hash = node.block_hash(height).await?;
+        for h in height..=tip {
+            let hash = node.block_hash(h).await?;
             let bytes = node.raw_block(&hash).await?;
-            let outputs = scanner::scan_block(&bytes, &wallets, height)?;
+            let outputs = scanner::scan_block(&bytes, wallets, h)?;
             store::write_outputs(db, &outputs).await?;
 
             if !outputs.is_empty() {
-                info!(height, outputs = outputs.len(), "scanned block");
-            } else if (height - min_resume) % 1000 == 0 || height == tip {
+                info!(height = h, outputs = outputs.len(), "scanned block");
+            } else if (h - min_resume) % 1000 == 0 || h == tip {
                 info!(
-                    height,
+                    height = h,
                     min_resume,
                     tip,
-                    progress_percent = ((height - min_resume) as f64 * 100.0
+                    progress_percent = ((h - min_resume) as f64 * 100.0
                         / ((tip - min_resume).max(1) as f64))
                         .round(),
                     "sync progress"
                 );
             }
         }
-
-        let new_tip = node.block_count().await?;
-        if new_tip <= tip {
-            return Ok(()); // still at tip
-        }
+        // Tip may have moved during the scan — continue from here, not min_resume.
+        height = tip + 1;
     }
 }
 
 // ── Watch blocks: continuously scan new blocks ─────────────────────────────
 
-async fn watch_blocks(db: PgPool, wallets: watch::Receiver<Vec<Wallet>>, node: Node) -> Result<()> {
+/// Incremental block watcher: scan new blocks from last_tip - 100 (reorg margin).
+/// If wallets changed, falls back to a full sync().
+async fn watch_blocks(
+    db: PgPool,
+    mut wallets: watch::Receiver<Vec<Wallet>>,
+    node: Node,
+    mut last_tip: u32,
+) -> Result<()> {
     loop {
         time::sleep(BLOCK_POLL).await;
-        sync(&db, &wallets, &node).await?;
+
+        // Wallet config changed — do a full re-sync from the new min_resume.
+        if wallets.has_changed().unwrap_or(false) {
+            info!("wallets changed, re-syncing from scratch");
+            let wallet_snapshot = wallets.borrow_and_update().clone();
+            last_tip = sync(&db, &wallet_snapshot, &node).await?;
+            info!(last_tip, "re-synced to chain tip");
+            continue;
+        }
+
+        let tip = node.block_count().await?;
+        let from = last_tip.min(tip).saturating_sub(100);
+        if from >= tip {
+            continue; // nothing new
+        }
+
+        let wallet_snapshot = wallets.borrow().clone();
+        for h in from..=tip {
+            let hash = node.block_hash(h).await?;
+            let bytes = node.raw_block(&hash).await?;
+            let outputs = scanner::scan_block(&bytes, &wallet_snapshot, h)?;
+            store::write_outputs(&db, &outputs).await?;
+
+            if !outputs.is_empty() {
+                info!(height = h, outputs = outputs.len(), "scanned block");
+            }
+        }
+        last_tip = tip + 1;
     }
 }
 
@@ -200,17 +240,6 @@ async fn mempool_outputs(
 ) -> Result<Vec<scanner::DetectedOutput>> {
     let bytes = node.raw_transaction(txid).await?;
     scanner::scan_mempool_tx(&bytes, wallets, tip)
-}
-
-/// Computes the height at which scanning should resume.
-///
-/// Uses `max(blockheight) - 100` from the reserve table if available, otherwise
-/// falls back to the per-view-key `birthday_height`, and finally to 0.
-fn compute_resume_height(max_confirmed: Option<i64>, birthday_height: Option<i64>) -> u32 {
-    max_confirmed
-        .map(|h| (h - 100).max(0) as u32)
-        .or_else(|| birthday_height.and_then(|h| u32::try_from(h).ok()))
-        .unwrap_or(0)
 }
 
 // ── Background tasks ───────────────────────────────────────────────────────
