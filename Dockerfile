@@ -10,5 +10,5 @@ RUN cargo build --release
 # Runtime stage
 FROM debian:bookworm-slim
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /app/target/release/zns-scanner /usr/local/bin/zns-scanner
-ENTRYPOINT ["/usr/local/bin/zns-scanner"]
+COPY --from=builder /app/target/release/zns-mempool /usr/local/bin/zns-mempool
+ENTRYPOINT ["/usr/local/bin/zns-mempool"]

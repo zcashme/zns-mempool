@@ -5,11 +5,11 @@ use jsonrpsee::{
     rpc_params,
 };
 
-/// JSON-RPC client for the Zcash full node.
+/// JSON-RPC client for the Zcash full chain.
 #[derive(Clone)]
-pub struct Node(HttpClient);
+pub struct Chain(HttpClient);
 
-impl Node {
+impl Chain {
     pub fn connect(url: &str) -> Result<Self> {
         Ok(Self(
             HttpClientBuilder::default()
@@ -38,7 +38,7 @@ impl Node {
             .request("getblock", rpc_params![hash, 0])
             .await
             .context("getblock failed")?;
-        hex::decode(encoded).context("node returned invalid block hex")
+        hex::decode(encoded).context("chain returned invalid block hex")
     }
 
     pub async fn raw_transaction(&self, txid: &str) -> Result<Vec<u8>> {
@@ -47,6 +47,6 @@ impl Node {
             .request("getrawtransaction", rpc_params![txid, 0])
             .await
             .context("getrawtransaction failed")?;
-        hex::decode(encoded).context("node returned invalid transaction hex")
+        hex::decode(encoded).context("chain returned invalid transaction hex")
     }
 }

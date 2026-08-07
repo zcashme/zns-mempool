@@ -12,7 +12,7 @@ use tonic::Request;
 use tracing::{error, info, warn};
 use zebra_indexer_proto::{Empty, ZebraClient, mempool_change_message::ChangeType};
 
-use crate::chain::Node;
+use crate::chain::Chain;
 use crate::decrypt::Wallet;
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     let db = sqlx::PgPool::connect(&database_url)
         .await
         .context("failed to connect to Postgres")?;
-    let node = Node::connect(&rpc_url)?;
+    let chain = Chain::connect(&rpc_url)?;
 
     // Subscribe before reading the first snapshot, so a configuration change made
     // during startup is queued and causes a harmless reload afterwards.
@@ -46,16 +46,17 @@ async fn main() -> Result<()> {
         database_url.clone(),
         db.clone(),
         wallet_updates,
+        chain.clone(),
     ));
 
     // Sync to chain tip before starting incremental watchers.
     let initial_wallets = wallets.borrow().clone();
-    let last_tip = sync(&db, &initial_wallets, &node).await?;
+    let last_tip = sync(&db, &initial_wallets, &chain).await?;
     info!("synced to chain tip");
 
     let expiry_task = tokio::spawn(expire_mempool(db.clone()));
-    let block_task = tokio::spawn(watch_blocks(db.clone(), wallets.clone(), node.clone(), last_tip));
-    let mempool_task = tokio::spawn(watch_mempool(db, wallets, node));
+    let block_task = tokio::spawn(watch_blocks(db.clone(), wallets.clone(), chain.clone(), last_tip));
+    let mempool_task = tokio::spawn(watch_mempool(db, wallets, chain));
 
     tokio::select! {
         result = wallet_task => result.context("wallet-config task panicked")??,
@@ -71,9 +72,9 @@ async fn main() -> Result<()> {
 
 /// Full sync: compute min_resume from the database, scan to chain tip.
 /// Called once on startup and when wallets change.  Returns the tip reached.
-async fn sync(db: &PgPool, wallets: &[Wallet], node: &Node) -> Result<u32> {
+async fn sync(db: &PgPool, wallets: &[Wallet], chain: &Chain) -> Result<u32> {
     if wallets.is_empty() {
-        return Ok(node.block_count().await?);
+        return Ok(chain.block_count().await?);
     }
 
     // Starting point: the lowest max(blockheight) across all wallets, minus 100
@@ -93,13 +94,13 @@ async fn sync(db: &PgPool, wallets: &[Wallet], node: &Node) -> Result<u32> {
 
     let mut height = min_resume;
     loop {
-        let tip = node.block_count().await?;
+        let tip = chain.block_count().await?;
         if height > tip {
             return Ok(tip);
         }
         for h in height..=tip {
-            let hash = node.block_hash(h).await?;
-            let bytes = node.raw_block(&hash).await?;
+            let hash = chain.block_hash(h).await?;
+            let bytes = chain.raw_block(&hash).await?;
             let outputs = scanner::scan_block(&bytes, wallets, h)?;
             store::write_outputs(db, &outputs).await?;
 
@@ -128,13 +129,13 @@ async fn sync(db: &PgPool, wallets: &[Wallet], node: &Node) -> Result<u32> {
 async fn watch_blocks(
     db: PgPool,
     wallets: watch::Receiver<Vec<Wallet>>,
-    node: Node,
+    chain: Chain,
     mut last_tip: u32,
 ) -> Result<()> {
     loop {
         time::sleep(BLOCK_POLL).await;
 
-        let tip = node.block_count().await?;
+        let tip = chain.block_count().await?;
         let from = last_tip.min(tip).saturating_sub(100);
         if from >= tip {
             continue; // nothing new
@@ -142,8 +143,8 @@ async fn watch_blocks(
 
         let wallet_snapshot = wallets.borrow().clone();
         for h in from..=tip {
-            let hash = node.block_hash(h).await?;
-            let bytes = node.raw_block(&hash).await?;
+            let hash = chain.block_hash(h).await?;
+            let bytes = chain.raw_block(&hash).await?;
             let outputs = scanner::scan_block(&bytes, &wallet_snapshot, h)?;
             store::write_outputs(&db, &outputs).await?;
 
@@ -160,7 +161,7 @@ async fn watch_blocks(
 async fn watch_mempool(
     db: PgPool,
     wallets: watch::Receiver<Vec<Wallet>>,
-    node: Node,
+    chain: Chain,
 ) -> Result<()> {
     let indexer_url = std::env::var("NODE_INDEXER_GRPC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8230".to_owned());
@@ -189,11 +190,11 @@ async fn watch_mempool(
                     Ok(ChangeType::Added) => {
                         let txid = hex::encode(event.tx_hash);
                         let wallet_snapshot = wallets.borrow().clone();
-                        let tip = node.block_count().await?;
+                        let tip = chain.block_count().await?;
                         if seen.contains(&txid) {
                             continue;
                         }
-                        match mempool_outputs(&wallet_snapshot, &node, &txid, tip).await {
+                        match mempool_outputs(&wallet_snapshot, &chain, &txid, tip).await {
                             Ok(outputs) => match store::write_outputs(&db, &outputs).await {
                                 Ok(()) => {
                                     seen.insert(txid.clone());
@@ -224,11 +225,11 @@ async fn watch_mempool(
 
 async fn mempool_outputs(
     wallets: &[Wallet],
-    node: &Node,
+    chain: &Chain,
     txid: &str,
     tip: u32,
 ) -> Result<Vec<scanner::DetectedOutput>> {
-    let bytes = node.raw_transaction(txid).await?;
+    let bytes = chain.raw_transaction(txid).await?;
     scanner::scan_mempool_tx(&bytes, wallets, tip)
 }
 
@@ -245,12 +246,15 @@ async fn subscribe_to_wallet_changes(database_url: &str) -> Result<PgListener> {
     Ok(listener)
 }
 
-/// Reloads and publishes a complete wallet snapshot after every Postgres notification.
+/// Reloads and publishes a complete wallet snapshot after every Postgres
+/// notification, then triggers a full rescan so new or modified wallets get
+/// their historical transactions detected.
 async fn refresh_wallets(
     mut listener: PgListener,
     database_url: String,
     db: PgPool,
     updates: watch::Sender<Vec<Wallet>>,
+    chain: Chain,
 ) -> Result<()> {
     info!("listening for zn_view_keys changes");
 
@@ -258,8 +262,11 @@ async fn refresh_wallets(
         match listener.recv().await {
             Ok(_) => match store::load_view_keys(&db).await {
                 Ok(next) => {
-                    updates.send_replace(next);
+                    updates.send_replace(next.clone());
                     info!("wallets refreshed via NOTIFY");
+                    if let Err(err) = sync(&db, &next, &chain).await {
+                        error!(%err, "rescan after wallet refresh failed");
+                    }
                 }
                 Err(err) => error!(%err, "could not refresh wallets; retaining last good snapshot"),
             },

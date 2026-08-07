@@ -1,4 +1,4 @@
-# zns-scanner
+# zns-mempool
 
 Stateless Zcash payment scanner daemon. Detects incoming and outgoing transactions for configured wallets and writes them to Postgres.
 
