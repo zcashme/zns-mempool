@@ -7,6 +7,53 @@ use zcash_protocol::{consensus::MainNetwork, memo::Memo};
 
 use crate::{decrypt::Wallet, scanner::DetectedOutput, scanner::Status};
 
+pub async fn ensure_table_exists(db: &PgPool, reserve_table_name: &str) -> Result<()> {
+    if reserve_table_name.is_empty()
+        || reserve_table_name.len() > 63
+        || !reserve_table_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        anyhow::bail!("invalid table name: {}", reserve_table_name);
+    }
+
+    sqlx::query(&format!(
+        r#"CREATE TABLE IF NOT EXISTS public."{tbl}" (
+            recipient_address text NOT NULL,
+            txid text NOT NULL,
+            pool text NOT NULL,
+            amount_zats bigint NOT NULL,
+            is_outgoing boolean NOT NULL DEFAULT false,
+            status text NOT NULL DEFAULT 'mempool',
+            blockheight bigint,
+            detected_at timestamptz NOT NULL DEFAULT now(),
+            memo text,
+            fee_zats bigint DEFAULT 0,
+            PRIMARY KEY (recipient_address, txid, is_outgoing)
+        )"#,
+        tbl = reserve_table_name,
+    ))
+    .execute(db)
+    .await?;
+
+    sqlx::query(&format!(
+        r#"ALTER TABLE public."{tbl}" ADD COLUMN IF NOT EXISTS fee_zats bigint DEFAULT 0"#,
+        tbl = reserve_table_name,
+    ))
+    .execute(db)
+    .await?;
+
+    if let Err(e) = sqlx::query(&format!(
+        r#"ALTER PUBLICATION supabase_realtime ADD TABLE public."{tbl}""#,
+        tbl = reserve_table_name,
+    ))
+    .execute(db)
+    .await
+    {
+        tracing::warn!(%e, table = reserve_table_name, "failed to add table to supabase_realtime (may already be a member)");
+    }
+
+    Ok(())
+}
+
 pub async fn load_view_keys(db: &PgPool) -> Result<Vec<Wallet>> {
     let rows = sqlx::query!(
         "select recipient_address, view_key, reserve_table_name, birthday_height
@@ -25,6 +72,9 @@ pub async fn load_view_keys(db: &PgPool) -> Result<Vec<Wallet>> {
                 recipient = row.recipient_address
             )
         })?;
+
+        ensure_table_exists(db, &row.reserve_table_name).await?;
+
         wallets.push(Wallet {
             recipient_address: row.recipient_address,
             ufvk,
