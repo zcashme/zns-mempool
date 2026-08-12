@@ -2,3 +2,4 @@
 .env.local
 .env
 zns-scanner-linux-amd64
+zns-mempool-image.tar.gz

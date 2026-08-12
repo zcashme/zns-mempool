@@ -77,8 +77,8 @@ pub async fn write_outputs(db: &PgPool, outputs: &[DetectedOutput]) -> Result<()
         let sql = format!(
             "insert into public.{tbl} (
                 recipient_address, txid, pool, amount_zats,
-                is_outgoing, status, blockheight, detected_at, memo
-             ) values ($1, $2, $3, $4, $5, $6, $7, now(), $8)
+                is_outgoing, status, blockheight, detected_at, memo, fee_zats
+             ) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)
              on conflict (recipient_address, txid, is_outgoing) do update
              set status = case
                     when excluded.status = 'confirmed' then 'confirmed'
@@ -87,7 +87,8 @@ pub async fn write_outputs(db: &PgPool, outputs: &[DetectedOutput]) -> Result<()
                  pool = excluded.pool,
                  amount_zats = excluded.amount_zats,
                  blockheight = coalesce(excluded.blockheight, {tbl}.blockheight),
-                 memo = coalesce({tbl}.memo, excluded.memo)",
+                 memo = coalesce({tbl}.memo, excluded.memo),
+                 fee_zats = excluded.fee_zats",
             tbl = reserve_table_name,
         );
         let memo: Option<String> = output
@@ -108,6 +109,7 @@ pub async fn write_outputs(db: &PgPool, outputs: &[DetectedOutput]) -> Result<()
             .bind(output.status.as_str())
             .bind(output.blockheight)
             .bind(memo)
+            .bind(output.fee_zats)
             .execute(db)
             .await
             .with_context(|| format!("failed to write output {} {}", output.txid, output.pool))?;

@@ -21,6 +21,7 @@ pub struct DecryptedShieldedOutput {
     pub pool: &'static str,
     pub amount_zats: u64,
     pub is_outgoing: bool,
+    pub is_change: bool,
     pub memo: MemoBytes,
 }
 
@@ -87,18 +88,20 @@ fn decrypt_sapling(
                     pool: "sapling",
                     amount_zats: note.value().inner(),
                     is_outgoing: false,
+                    is_change: false,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
                 continue;
             }
-            // Internal IVK → change (part of outgoing)
+            // Internal IVK → change (stays in wallet, not sent out)
             if let Some((note, _, memo)) = try_note_decryption(&domain, &key.ivk_internal, output) {
                 found.push(DecryptedShieldedOutput {
                     recipient_address: key.recipient_address.clone(),
                     pool: "sapling",
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
+                    is_change: true,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
@@ -117,6 +120,7 @@ fn decrypt_sapling(
                     pool: "sapling",
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
+                    is_change: false,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
@@ -168,18 +172,20 @@ fn decrypt_orchard_pool<V: DomainVersion>(
                     pool: pool_name,
                     amount_zats: note.value().inner(),
                     is_outgoing: false,
+                    is_change: false,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
                 continue;
             }
-            // Internal IVK → change (part of outgoing)
+            // Internal IVK → change (stays in wallet, not sent out)
             if let Some((note, _, memo)) = try_note_decryption(&domain, &key.ivk_internal, action) {
                 found.push(DecryptedShieldedOutput {
                     recipient_address: key.recipient_address.clone(),
                     pool: pool_name,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
+                    is_change: true,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });
@@ -198,6 +204,7 @@ fn decrypt_orchard_pool<V: DomainVersion>(
                     pool: pool_name,
                     amount_zats: note.value().inner(),
                     is_outgoing: true,
+                    is_change: false,
                     memo: MemoBytes::from_bytes(&memo)
                         .expect("decryption always returns a 512-byte memo"),
                 });

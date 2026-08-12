@@ -38,6 +38,8 @@ pub struct DetectedOutput {
     pub pool: String,
     pub amount_zats: i64,
     pub is_outgoing: bool,
+    pub is_change: bool,
+    pub fee_zats: i64,
     pub memo: Option<MemoBytes>,
     pub status: Status,
     pub blockheight: Option<i64>,
@@ -105,6 +107,22 @@ fn scan_transaction(
     }
 
     let txid = tx.txid().to_string();
+
+    // Extract the public fee from the transaction's value balances.
+    // For a purely shielded transaction, the fee equals the sum of value balances.
+    let fee_zats: i64 = tx
+        .orchard_bundle()
+        .map(|b| i64::from(*b.value_balance()))
+        .unwrap_or(0)
+        + tx
+            .sapling_bundle()
+            .map(|b| i64::from(*b.value_balance()))
+            .unwrap_or(0)
+        + tx
+            .ironwood_bundle()
+            .map(|b| i64::from(*b.value_balance()))
+            .unwrap_or(0);
+
     let mut found =
         scan_shielded_outputs(tx, view_keys, effective_height, &txid, status, blockheight);
     found.extend(scan_transparent_outputs(
@@ -114,11 +132,17 @@ fn scan_transaction(
         status,
         blockheight,
     ));
+
+    // Attach the fee to every detected output before aggregating.
+    for o in &mut found {
+        o.fee_zats = fee_zats;
+    }
+
     aggregate_outputs(found)
 }
 
 /// Aggregates detected outputs by (recipient_address, txid, is_outgoing),
-/// summing amounts and joining pool names with "+".
+/// summing amounts (excluding change) and joining pool names with "+".
 fn aggregate_outputs(outputs: Vec<DetectedOutput>) -> Vec<DetectedOutput> {
     let mut groups: HashMap<(String, String, bool), Vec<DetectedOutput>> = HashMap::new();
     for output in outputs {
@@ -128,7 +152,13 @@ fn aggregate_outputs(outputs: Vec<DetectedOutput>) -> Vec<DetectedOutput> {
 
     let mut result = Vec::with_capacity(groups.len());
     for (_, group) in groups {
-        let amount_zats: i64 = group.iter().map(|o| o.amount_zats).sum();
+        // Sum only non-change outputs — change notes stay in the wallet
+        // and should not inflate the outgoing amount.
+        let amount_zats: i64 = group
+            .iter()
+            .filter(|o| !o.is_change)
+            .map(|o| o.amount_zats)
+            .sum();
         let pools: Vec<String> = {
             let set: HashSet<String> = group.iter().map(|o| o.pool.clone()).collect();
             let mut v: Vec<String> = set.into_iter().collect();
@@ -144,6 +174,8 @@ fn aggregate_outputs(outputs: Vec<DetectedOutput>) -> Vec<DetectedOutput> {
             pool,
             amount_zats,
             is_outgoing: first.is_outgoing,
+            is_change: false,
+            fee_zats: first.fee_zats,
             memo,
             status: first.status,
             blockheight: first.blockheight,
@@ -193,6 +225,8 @@ fn scan_transparent_outputs(
                     pool: "transparent".to_string(),
                     amount_zats: tx_out.value().into_u64() as i64,
                     is_outgoing: false,
+                    is_change: false,
+                    fee_zats: 0,
                     memo: None,
                     status,
                     blockheight,
@@ -216,6 +250,8 @@ fn shielded_to_detected_output(
         pool: output.pool.to_string(),
         amount_zats: output.amount_zats as i64,
         is_outgoing: output.is_outgoing,
+        is_change: output.is_change,
+        fee_zats: 0,
         memo: Some(output.memo),
         status,
         blockheight,
