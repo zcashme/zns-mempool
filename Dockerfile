@@ -1,11 +1,11 @@
 # Build stage
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.89-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+COPY .sqlx ./.sqlx
 COPY src ./src
-ARG DATABASE_URL
-ENV DATABASE_URL=$DATABASE_URL
-RUN cargo build --release
+ENV SQLX_OFFLINE=true
+RUN cargo build --locked --release
 
 # Runtime stage
 FROM debian:bookworm-slim

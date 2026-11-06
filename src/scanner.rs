@@ -114,12 +114,10 @@ fn scan_transaction(
         .orchard_bundle()
         .map(|b| i64::from(*b.value_balance()))
         .unwrap_or(0)
-        + tx
-            .sapling_bundle()
+        + tx.sapling_bundle()
             .map(|b| i64::from(*b.value_balance()))
             .unwrap_or(0)
-        + tx
-            .ironwood_bundle()
+        + tx.ironwood_bundle()
             .map(|b| i64::from(*b.value_balance()))
             .unwrap_or(0);
 
@@ -146,7 +144,11 @@ fn scan_transaction(
 fn aggregate_outputs(outputs: Vec<DetectedOutput>) -> Vec<DetectedOutput> {
     let mut groups: HashMap<(String, String, bool), Vec<DetectedOutput>> = HashMap::new();
     for output in outputs {
-        let key = (output.recipient_address.clone(), output.txid.clone(), output.is_outgoing);
+        let key = (
+            output.recipient_address.clone(),
+            output.txid.clone(),
+            output.is_outgoing,
+        );
         groups.entry(key).or_default().push(output);
     }
 
@@ -270,7 +272,7 @@ fn transparent_index(view_keys: &[Wallet]) -> Vec<(String, Vec<u8>)> {
 }
 
 fn derive_transparent_script(ufvk: &UnifiedFullViewingKey) -> Option<Vec<u8>> {
-    let account_pubkey = ufvk.transparent()?;
+    let account_pubkey = ufvk.p2pkh()?;
     let external_ivk = account_pubkey.derive_external_ivk().ok()?;
     let (address, _index) = external_ivk.default_address();
     Some(transparent_script_bytes(&address))
@@ -296,6 +298,101 @@ fn transparent_script_bytes(addr: &zcash_transparent::address::TransparentAddres
             script.extend_from_slice(hash);
             script.push(0x87); // OP_EQUAL
             script
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zcash_keys::keys::UnifiedSpendingKey;
+    use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+    use zcash_protocol::value::Zatoshis;
+    use zcash_transparent::bundle::{Authorized as TransparentAuthorized, Bundle, TxOut};
+    use zip32::AccountId;
+
+    const NU7_HEIGHT: u32 = 3_543_405;
+
+    #[test]
+    fn mainnet_nu7_activation() {
+        assert_eq!(
+            BranchId::for_height(&MainNetwork, (NU7_HEIGHT - 1).into()),
+            BranchId::Nu6_3,
+        );
+        assert_eq!(
+            BranchId::for_height(&MainNetwork, NU7_HEIGHT.into()),
+            BranchId::Nu7,
+        );
+        assert_eq!(u32::from(BranchId::Nu7), 0x7719_0ad9);
+    }
+
+    #[test]
+    fn scans_transparent_payments_before_and_after_nu7() {
+        let ufvk = UnifiedSpendingKey::from_seed(&MainNetwork, &[42; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key();
+        let (address, _) = ufvk
+            .p2pkh()
+            .unwrap()
+            .derive_external_ivk()
+            .unwrap()
+            .default_address();
+        let wallet = Wallet {
+            ufvk,
+            recipient_address: "test-wallet".into(),
+            reserve_table_name: "test_reserves".into(),
+            birthday_height: None,
+        };
+
+        // Synthetic serialization fixtures, not consensus-valid transactions.
+        for (branch, version, tip) in [
+            (BranchId::Nu6_3, TxVersion::V6, NU7_HEIGHT - 2),
+            (BranchId::Nu7, TxVersion::V5, NU7_HEIGHT),
+            (BranchId::Nu7, TxVersion::V6, NU7_HEIGHT),
+        ] {
+            let transparent = Some(Bundle {
+                vin: vec![],
+                vout: vec![TxOut::new(
+                    Zatoshis::from_u64(123_456).unwrap(),
+                    address.script().into(),
+                )],
+                authorization: TransparentAuthorized,
+            });
+            let data = if version == TxVersion::V6 {
+                TransactionData::<Authorized>::from_parts_v6(
+                    branch,
+                    0,
+                    (tip + 120).into(),
+                    transparent,
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                TransactionData::<Authorized>::from_parts(
+                    version,
+                    branch,
+                    0,
+                    (tip + 120).into(),
+                    transparent,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            let tx = data.freeze().unwrap();
+            let mut bytes = vec![];
+            tx.write(&mut bytes).unwrap();
+            let outputs = scan_mempool_tx(&bytes, std::slice::from_ref(&wallet), tip).unwrap();
+            assert_eq!(outputs.len(), 1);
+            let output = &outputs[0];
+            assert_eq!(output.recipient_address, wallet.recipient_address);
+            assert_eq!(output.txid, tx.txid().to_string());
+            assert_eq!(output.amount_zats, 123_456);
+            assert_eq!(output.pool, "transparent");
+            assert_eq!(output.status, Status::Mempool);
+            assert_eq!(output.blockheight, None);
+            assert!(!output.is_outgoing);
         }
     }
 }

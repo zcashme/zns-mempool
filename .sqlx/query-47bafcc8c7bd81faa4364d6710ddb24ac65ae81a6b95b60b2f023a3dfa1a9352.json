@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select distinct reserve_table_name from public.zn_view_keys",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reserve_table_name",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "47bafcc8c7bd81faa4364d6710ddb24ac65ae81a6b95b60b2f023a3dfa1a9352"
+}

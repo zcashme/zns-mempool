@@ -10,7 +10,9 @@ use crate::{decrypt::Wallet, scanner::DetectedOutput, scanner::Status};
 pub async fn ensure_table_exists(db: &PgPool, reserve_table_name: &str) -> Result<()> {
     if reserve_table_name.is_empty()
         || reserve_table_name.len() > 63
-        || !reserve_table_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        || !reserve_table_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_')
     {
         anyhow::bail!("invalid table name: {}", reserve_table_name);
     }

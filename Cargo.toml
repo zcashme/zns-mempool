@@ -2,23 +2,23 @@
 name = "zns-mempool"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [dependencies]
 anyhow = "1"
 hex = "0.4"
 jsonrpsee = { version = "0.24", features = ["http-client"] }
-orchard = "=0.15.4"
-sapling-crypto = "=0.7.0"
+orchard = "=0.16.0"
+sapling-crypto = "=0.9.0"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zebra-indexer-proto = "2.4.0"
-zcash_keys = { version = "=0.16.1", default-features = false, features = ["std", "sapling", "orchard", "transparent-inputs"] }
-zcash_note_encryption = "=0.4.2"
-zcash_primitives = "=0.30.0"
-zcash_protocol = "=0.10.3"
-zcash_transparent = "=0.10.0"
-zip32 = "=0.2.1"
+zcash_keys = { version = "=0.17.0", default-features = false, features = ["std", "sapling", "orchard", "transparent-inputs"] }
+zcash_note_encryption = "=0.5.1"
+zcash_primitives = "=0.31.0"
+zcash_protocol = "=0.11.0"
+zcash_transparent = "=0.11.0"
+zip32 = "=0.3.0"

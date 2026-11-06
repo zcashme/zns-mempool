@@ -55,7 +55,12 @@ async fn main() -> Result<()> {
     info!("synced to chain tip");
 
     let expiry_task = tokio::spawn(expire_mempool(db.clone()));
-    let block_task = tokio::spawn(watch_blocks(db.clone(), wallets.clone(), chain.clone(), last_tip));
+    let block_task = tokio::spawn(watch_blocks(
+        db.clone(),
+        wallets.clone(),
+        chain.clone(),
+        last_tip,
+    ));
     let mempool_task = tokio::spawn(watch_mempool(db, wallets, chain));
 
     tokio::select! {
@@ -74,7 +79,7 @@ async fn main() -> Result<()> {
 /// Called once on startup and when wallets change.  Returns the tip reached.
 async fn sync(db: &PgPool, wallets: &[Wallet], chain: &Chain) -> Result<u32> {
     if wallets.is_empty() {
-        return Ok(chain.block_count().await?);
+        return chain.block_count().await;
     }
 
     // Starting point: the lowest max(blockheight) across all wallets, minus 100

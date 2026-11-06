@@ -3,3 +3,4 @@
 .env
 zns-scanner-linux-amd64
 zns-mempool-image.tar.gz
+zns-mempool-nu7-linux-amd64.tar.gz
